@@ -1,0 +1,52 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: helmsman-apps
+  namespace: argocd
+spec:
+  generators:
+    - matrix:
+        generators:
+          # Generator 1: finds every directory under apps/ in the fleet repo.
+          # Each directory = one application. Adding a new app = adding a folder.
+          - git:
+              repoURL: https://github.com/subhankar720/helmsman-fleet.git
+              revision: main
+              directories:
+                - path: "apps/*"
+          # Generator 2: finds every Argo CD registered cluster
+          # that has the label platform-enabled=true.
+          # Adding a new cluster = labelling it and Argo CD fans out automatically.
+          - clusters:
+              selector:
+                matchLabels:
+                  platform-enabled: "true"
+  template:
+    metadata:
+      # Name: <app-directory-name>-<cluster-name>
+      # e.g. sample-app-helmsman-onprem
+      name: '{{path.basename}}-{{name}}'
+    spec:
+      project: default
+      # Multi-source: chart comes from golden-path-chart/,
+      # values come from apps/<appname>/values-<clustername>.yaml
+      # The $values ref gives the chart access to files outside its own directory.
+      sources:
+        - repoURL: https://github.com/subhankar720/helmsman-fleet.git
+          targetRevision: main
+          path: golden-path-chart
+          helm:
+            valueFiles:
+              - $values/apps/{{path.basename}}/values-{{name}}.yaml
+        - repoURL: https://github.com/subhankar720/helmsman-fleet.git
+          targetRevision: main
+          ref: values
+      destination:
+        server: '{{server}}'
+        namespace: '{{path.basename}}'
+      syncPolicy:
+        automated:
+          prune: true      # delete resources removed from git
+          selfHeal: true   # revert manual cluster edits
+        syncOptions:
+          - CreateNamespace=true
