@@ -1,0 +1,9 @@
+apiVersion: v2
+name: golden-path-chart
+description: |
+  Helmsman Golden Path Chart.
+  Standard StatefulSet deployment template for all platform-managed applications.
+  Every application deployed through Helmsman uses this chart.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

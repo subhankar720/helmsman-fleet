@@ -1,0 +1,58 @@
+# ── Default deny ──────────────────────────────────────────────────────────────
+# Every app pod starts with all ingress and egress blocked.
+# Subsequent policies below open only what's needed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.appName }}-default-deny
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "golden-path-chart.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "golden-path-chart.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# ── Allow ingress on app port ─────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.appName }}-allow-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "golden-path-chart.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "golden-path-chart.selectorLabels" . | nindent 6 }}
+  ingress:
+    - ports:
+        - port: {{ .Values.container.port }}
+          protocol: TCP
+  policyTypes:
+    - Ingress
+---
+# ── Allow DNS egress ──────────────────────────────────────────────────────────
+# Without this, the app container cannot resolve any hostname.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.appName }}-allow-dns
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "golden-path-chart.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "golden-path-chart.selectorLabels" . | nindent 6 }}
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+  policyTypes:
+    - Egress

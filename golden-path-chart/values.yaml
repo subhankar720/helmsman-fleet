@@ -1,0 +1,43 @@
+# ── Identity ──────────────────────────────────────────────────────────────────
+appName: ""
+owningTeam: ""
+costCenterId: ""
+notifyChannel: ""
+
+# ── Image ─────────────────────────────────────────────────────────────────────
+image:
+  repository: ""
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+# ── Application container ─────────────────────────────────────────────────────
+container:
+  port: 8080
+  command: []
+  env: {}
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "500m"
+    memory: "256Mi"
+
+# ── Replicas ──────────────────────────────────────────────────────────────────
+replicas: 1
+
+# ── Service ───────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+
+# ── OIDC (Phase 2 — disabled for now) ────────────────────────────────────────
+oidc:
+  enabled: false
+  issuerUrl: ""
+  clientId: ""
+
+# ── Fluent Bit sidecar ────────────────────────────────────────────────────────
+fluentbit:
+  image: "fluent/fluent-bit:3.2"

@@ -1,0 +1,39 @@
+# ── Headless Service ──────────────────────────────────────────────────────────
+# Required by StatefulSet for stable pod DNS.
+# Gives each pod a DNS entry: <pod>.<appName>-headless.<namespace>.svc.cluster.local
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.appName }}-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "golden-path-chart.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "golden-path-chart.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.container.port }}
+      targetPort: http
+---
+# ── Traffic Service ───────────────────────────────────────────────────────────
+# The actual entrypoint for traffic into the application.
+# Phase 1: ClusterIP (internal only).
+# Phase 2+: when oidc.enabled=true, traffic hits oauth2-proxy port (4180) first.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.appName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "golden-path-chart.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "golden-path-chart.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
