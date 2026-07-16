@@ -428,6 +428,37 @@ EOF
             else
                 fail "Failed to create helmsman-platform-config in spoke"
             fi
+            # --- Ensure ExternalSecrets ClusterSecretStore can reach Vault via NodePort ---
+            # Determine hub worker node IP(s) (NodePort listens on node interfaces)
+            HUB_WORKER_IP=$(docker inspect helmsman-hub-worker --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
+            HUB_WORKER_IP2=$(docker inspect helmsman-hub-worker2 --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
+            # Prefer first worker IP, fallback to second, then to HUB_IP
+            TARGET_IP="${HUB_WORKER_IP:-${HUB_WORKER_IP2:-$HUB_IP}}"
+            if [ -z "$TARGET_IP" ]; then
+                info "Could not determine hub worker IP to expose Vault NodePort; skipping ClusterSecretStore patch"
+            else
+                info "Testing reachability of Vault NodePort on $TARGET_IP:30082 from spoke cluster"
+                if kubectl --context "$SPOKE_CONTEXT" -n default run --rm -i --tty vault-check --image=curlimages/curl:latest --restart=Never -- curl -sS --max-time 5 http://${TARGET_IP}:30082/v1/sys/health -w '\nHTTP_CODE:%{http_code}\n' > /dev/null 2>&1; then
+                    ok "Vault NodePort reachable at ${TARGET_IP}:30082"
+                    fix "Patching ClusterSecretStore 'vault-backend' in spoke to use http://${TARGET_IP}:30082"
+                    kubectl --context "$SPOKE_CONTEXT" patch clustersecretstore vault-backend --type=merge -p "{\"spec\":{\"provider\":{\"vault\":{\"server\":\"http://${TARGET_IP}:30082\"}}}}" > /dev/null 2>&1 || true
+                    # Wait for ExternalSecrets controller to validate the store
+                    info "Waiting for ClusterSecretStore 'vault-backend' to become Ready (timeout 30s)"
+                    for i in {1..6}; do
+                        READY=$(kubectl --context "$SPOKE_CONTEXT" get clustersecretstore vault-backend -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
+                        if [ "$READY" = "True" ]; then
+                            ok "ClusterSecretStore 'vault-backend' is Ready"
+                            break
+                        fi
+                        sleep 5
+                    done
+                    if [ "$READY" != "True" ]; then
+                        fail "ClusterSecretStore 'vault-backend' validation still failing; check ExternalSecrets controller logs"
+                    fi
+                else
+                    fail "Vault NodePort not reachable at ${TARGET_IP}:30082 from spoke — cannot validate ClusterSecretStore"
+                fi
+            fi
         else
             info "Could not determine Hub container IP; skipping helmsman-platform-config update"
         fi
