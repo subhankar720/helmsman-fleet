@@ -430,6 +430,16 @@ EOF
             else
                 fail "Failed to apply helmsman-platform-config in spoke"
             fi
+            # Validate that the secret contains the expected values
+            EXPECTED_KEYCLOAK_URL="http://${HUB_IP}:30081"
+            EXPECTED_VAULT_URL="http://${HUB_IP}:30082"
+            ACTUAL_KEYCLOAK_URL=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret helmsman-platform-config -o jsonpath='{.data.keycloak-url}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+            ACTUAL_VAULT_URL=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret helmsman-platform-config -o jsonpath='{.data.vault-url}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+            if [ "$ACTUAL_KEYCLOAK_URL" = "$EXPECTED_KEYCLOAK_URL" ] && [ "$ACTUAL_VAULT_URL" = "$EXPECTED_VAULT_URL" ]; then
+                ok "helmsman-platform-config validation passed"
+            else
+                fail "helmsman-platform-config validation failed: got keycloak-url=$ACTUAL_KEYCLOAK_URL vault-url=$ACTUAL_VAULT_URL"
+            fi
             # --- Ensure ExternalSecrets ClusterSecretStore can reach Vault via NodePort ---
             # Determine hub worker node IP(s) (NodePort listens on node interfaces)
             HUB_WORKER_IP=$(docker inspect helmsman-hub-worker --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
