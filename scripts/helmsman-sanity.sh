@@ -486,6 +486,34 @@ header "H. Argo CD Cluster and App Status"
 # =============================================================================
 sleep 5
 
+# Quick validation: ensure argocd-repo-server ClusterIP is reachable from the
+# application-controller; a common failure after Docker/kind restarts is that
+# kube-proxy/iptables leaves ClusterIP traffic broken causing ComparisonError.
+header "H.1 Argocd repo-server reachability"
+REPO_OK=true
+CTRLS=$(kubectl get pods -n argocd --context "$HUB_CONTEXT" -l app.kubernetes.io/name=argocd-application-controller -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+for POD in $CTRLS; do
+    [ -z "$POD" ] && continue
+    if kubectl exec -n argocd --context "$HUB_CONTEXT" "$POD" -- bash -lc 'exec 3<>/dev/tcp/argocd-repo-server/8081 >/dev/null 2>&1' > /dev/null 2>&1; then
+        ok "argocd-repo-server reachable from $POD"
+    else
+        fail "argocd-repo-server unreachable from $POD"
+        REPO_OK=false
+    fi
+done
+
+if [ "$REPO_OK" = false ]; then
+    fix "Attempting auto-recovery for argocd-repo-server connectivity"
+    kubectl rollout restart daemonset/kube-proxy -n kube-system --context "$HUB_CONTEXT" > /dev/null 2>&1 || true
+    kubectl rollout status daemonset/kube-proxy -n kube-system --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1 || true
+    kubectl rollout restart deployment/argocd-repo-server -n argocd --context "$HUB_CONTEXT" > /dev/null 2>&1 || true
+    kubectl rollout status deployment/argocd-repo-server -n argocd --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1 || true
+    kubectl rollout restart deployment/argocd-application-controller -n argocd --context "$HUB_CONTEXT" > /dev/null 2>&1 || true
+    kubectl rollout status deployment/argocd-application-controller -n argocd --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1 || true
+    info "Waiting 15s for Argo CD components to stabilise..."
+    sleep 15
+fi
+
 # Use kubectl directly — no argocd CLI dependency for status checks
 info "Cluster Secret server URL stored in Argo CD:"
 STORED=$(kubectl get secret "$CLUSTER_SECRET_NAME" \
