@@ -19,13 +19,18 @@ spec:
       containers:
         - name: keycloak
           image: quay.io/keycloak/keycloak:26.3.3
-          # start-dev: in-memory H2 db, no TLS, realm auto-imported from /data/import
           args: ["start-dev", "--import-realm"]
           env:
             - name: KEYCLOAK_ADMIN
-              value: admin
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin-credentials
+                  key: admin-user
             - name: KEYCLOAK_ADMIN_PASSWORD
-              value: helmsman123
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-admin-credentials
+                  key: admin-password
             - name: KC_HTTP_PORT
               value: "8080"
           ports:
