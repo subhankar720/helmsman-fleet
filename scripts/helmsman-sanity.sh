@@ -413,6 +413,24 @@ EOF
             argocd.argoproj.io/refresh=normal --overwrite > /dev/null 2>&1 || true
         info "Waiting 15s for ApplicationSet to reconcile..."
         sleep 15
+        # Ensure spoke apps have a platform config pointing at the current Hub HTTP endpoint
+        header "F.1 Hub HTTP endpoint secret for spoke applications"
+        HUB_IP=$(docker inspect "$HUB_CONTAINER" --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
+        if [ -n "$HUB_IP" ]; then
+            fix "Updating helmsman-platform-config secret in spoke to point at Hub $HUB_IP"
+            kubectl --context "$SPOKE_CONTEXT" -n sample-app delete secret helmsman-platform-config 2>/dev/null || true
+            if kubectl --context "$SPOKE_CONTEXT" -n sample-app create secret generic helmsman-platform-config \
+                --from-literal=keycloak-url="http://${HUB_IP}:30081" \
+                --from-literal=keycloak-admin-user=admin \
+                --from-literal=keycloak-admin-password=helmsman123 \
+                --from-literal=keycloak-realm=helmsman > /dev/null 2>&1; then
+                ok "helmsman-platform-config created in spoke (keycloak-url=http://${HUB_IP}:30081)"
+            else
+                fail "Failed to create helmsman-platform-config in spoke"
+            fi
+        else
+            info "Could not determine Hub container IP; skipping helmsman-platform-config update"
+        fi
     fi
 fi
 
