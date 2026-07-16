@@ -14,4 +14,5 @@ spec:
       port: 8200
       targetPort: 8200
       protocol: TCP
-  type: ClusterIP
+      nodePort: 30082
+  type: NodePort
