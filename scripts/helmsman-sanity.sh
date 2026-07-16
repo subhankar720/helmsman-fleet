@@ -423,8 +423,10 @@ EOF
                 --from-literal=keycloak-url="http://${HUB_IP}:30081" \
                 --from-literal=keycloak-admin-user=admin \
                 --from-literal=keycloak-admin-password=helmsman123 \
-                --from-literal=keycloak-realm=helmsman > /dev/null 2>&1; then
-                ok "helmsman-platform-config created in spoke (keycloak-url=http://${HUB_IP}:30081)"
+                --from-literal=keycloak-realm=helmsman \
+                --from-literal=vault-url="http://${HUB_IP}:30082" \
+                --from-literal=vault-token=root > /dev/null 2>&1; then
+                ok "helmsman-platform-config created in spoke (keycloak-url=http://${HUB_IP}:30081, vault-url=http://${HUB_IP}:30082)"
             else
                 fail "Failed to create helmsman-platform-config in spoke"
             fi
