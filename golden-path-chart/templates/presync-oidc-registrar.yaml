@@ -1,6 +1,6 @@
+cat > golden-path-chart/templates/presync-oidc-registrar.yaml << 'TEMPLATE'
 {{- if .Values.oidc.enabled }}
 ---
-# ServiceAccount for the registrar Job — needs permission to write Secrets
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -52,12 +52,13 @@ data:
   register.py: |
     #!/usr/bin/env python3
     """
-    Helmsman OIDC Registrar
+    Helmsman OIDC Registrar — v2
+    Uses the kubernetes Python client instead of shelling out to kubectl.
     Idempotent: creates the Keycloak client if it doesn't exist,
-    then writes client_id + client_secret into a Kubernetes Secret.
-    Phase 2.3 upgrade: replace the kubectl Secret write with a Vault write.
+    then writes/updates the OIDC Secret in the app namespace.
+    Phase 2.3 upgrade: replace the K8s Secret write with a Vault write via hvac.
     """
-    import os, sys, json, subprocess
+    import os, sys, json
     import urllib.request, urllib.parse, urllib.error
 
     KEYCLOAK_URL  = os.environ["KEYCLOAK_URL"].rstrip("/")
@@ -73,15 +74,13 @@ data:
             headers["Authorization"] = f"Bearer {token}"
         if data and isinstance(data, dict):
             data = json.dumps(data).encode()
-            headers["Content-Type"] = "application/json"
         elif data and isinstance(data, str):
             data = data.encode()
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req) as resp:
-                body = resp.read().decode()
-                return resp.status, resp.headers, body
+                return resp.status, resp.headers, resp.read().decode()
         except urllib.error.HTTPError as e:
             return e.code, e.headers, e.read().decode()
 
@@ -125,8 +124,7 @@ data:
         if status not in (201, 200):
             print(f"ERROR: Failed to create client (HTTP {status}): {body}")
             sys.exit(1)
-        location = headers.get("Location", "")
-        internal_id = location.rstrip("/").split("/")[-1]
+        internal_id = headers.get("Location", "").rstrip("/").split("/")[-1]
         print(f"✓ Created client '{APP_NAME}' (id: {internal_id})")
 
     # ── Step 4: Get client secret ─────────────────────────────────────────────
@@ -139,28 +137,38 @@ data:
     client_secret = json.loads(body)["value"]
     print(f"✓ Client secret retrieved")
 
-    # ── Step 5: Write to Kubernetes Secret ────────────────────────────────────
-    # Phase 2.3: replace this block with a Vault write
-    result = subprocess.run([
-        "kubectl", "create", "secret", "generic", f"{APP_NAME}-oidc",
-        f"--from-literal=client-id={APP_NAME}",
-        f"--from-literal=client-secret={client_secret}",
-        f"--from-literal=issuer-url={KEYCLOAK_URL}/realms/{REALM}",
-        f"--namespace={APP_NAMESPACE}",
-        "--dry-run=client", "-o", "yaml"
-    ], capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"ERROR: kubectl dry-run failed: {result.stderr}")
-        sys.exit(1)
-    apply = subprocess.run(
-        ["kubectl", "apply", "-f", "-"],
-        input=result.stdout, capture_output=True, text=True
+    # ── Step 5: Write Secret using kubernetes Python client ───────────────────
+    # No kubectl binary needed — uses in-cluster ServiceAccount token
+    from kubernetes import client as k8s_client, config as k8s_config
+    k8s_config.load_incluster_config()
+    v1 = k8s_client.CoreV1Api()
+
+    secret_body = k8s_client.V1Secret(
+        metadata=k8s_client.V1ObjectMeta(
+            name=f"{APP_NAME}-oidc",
+            namespace=APP_NAMESPACE,
+            labels={"app.kubernetes.io/managed-by": "helmsman-oidc-registrar"}
+        ),
+        string_data={
+            "client-id":   APP_NAME,
+            "client-secret": client_secret,
+            "issuer-url":  f"{KEYCLOAK_URL}/realms/{REALM}"
+        }
     )
-    if apply.returncode != 0:
-        print(f"ERROR: kubectl apply failed: {apply.stderr}")
-        sys.exit(1)
-    print(f"✓ Secret '{APP_NAME}-oidc' written to namespace '{APP_NAMESPACE}'")
-    print("Registration complete.")
+
+    try:
+        v1.read_namespaced_secret(f"{APP_NAME}-oidc", APP_NAMESPACE)
+        v1.replace_namespaced_secret(f"{APP_NAME}-oidc", APP_NAMESPACE, secret_body)
+        print(f"✓ Secret '{APP_NAME}-oidc' updated in namespace '{APP_NAMESPACE}'")
+    except k8s_client.exceptions.ApiException as e:
+        if e.status == 404:
+            v1.create_namespaced_secret(APP_NAMESPACE, secret_body)
+            print(f"✓ Secret '{APP_NAME}-oidc' created in namespace '{APP_NAMESPACE}'")
+        else:
+            print(f"ERROR writing Secret: {e}")
+            sys.exit(1)
+
+    print("✓ Registration complete.")
 ---
 apiVersion: batch/v1
 kind: Job
@@ -179,7 +187,12 @@ spec:
       containers:
         - name: registrar
           image: python:3.12-slim
-          command: ["python", "/scripts/register.py"]
+          command:
+            - sh
+            - -c
+            - |
+              pip install kubernetes --quiet --no-cache-dir && \
+              python /scripts/register.py
           env:
             - name: APP_NAME
               value: {{ .Values.appName | quote }}
@@ -211,13 +224,14 @@ spec:
           resources:
             requests:
               cpu: "50m"
-              memory: "64Mi"
+              memory: "128Mi"
             limits:
               cpu: "200m"
-              memory: "128Mi"
+              memory: "256Mi"
       volumes:
         - name: script
           configMap:
             name: {{ .Values.appName }}-oidc-registrar-script
             defaultMode: 0755
 {{- end }}
+TEMPLATE
