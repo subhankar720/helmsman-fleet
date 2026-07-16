@@ -51,11 +51,10 @@ data:
   register.py: |
     #!/usr/bin/env python3
     """
-    Helmsman OIDC Registrar — v2
-    Uses the kubernetes Python client instead of shelling out to kubectl.
-    Idempotent: creates the Keycloak client if it doesn't exist,
-    then writes/updates the OIDC Secret in the app namespace.
-    Phase 2.3 upgrade: replace the K8s Secret write with a Vault write via hvac.
+    Helmsman OIDC Registrar — v3
+    Writes OIDC client credentials to Vault (KV v2).
+    ESO then syncs them into a K8s Secret in the app namespace.
+    The pod never talks to Vault directly — it just reads a mounted Secret.
     """
     import os, sys, json
     import urllib.request, urllib.parse, urllib.error
@@ -66,11 +65,15 @@ data:
     APP_NAME      = os.environ["APP_NAME"]
     APP_NAMESPACE = os.environ["APP_NAMESPACE"]
     REALM         = os.environ.get("KEYCLOAK_REALM", "helmsman")
+    VAULT_ADDR    = os.environ["VAULT_ADDR"].rstrip("/")
+    VAULT_TOKEN   = os.environ["VAULT_TOKEN"]
 
-    def http(method, url, data=None, token=None):
+    def http(method, url, data=None, token=None, vault_token=None):
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
+        if vault_token:
+            headers["X-Vault-Token"] = vault_token
         if data and isinstance(data, dict):
             data = json.dumps(data).encode()
         elif data and isinstance(data, str):
@@ -83,7 +86,7 @@ data:
         except urllib.error.HTTPError as e:
             return e.code, e.headers, e.read().decode()
 
-    # ── Step 1: Get admin token ───────────────────────────────────────────────
+    # ── Step 1: Get Keycloak admin token ─────────────────────────────────────
     token_data = urllib.parse.urlencode({
         "username": ADMIN_USER, "password": ADMIN_PASS,
         "grant_type": "password", "client_id": "admin-cli"
@@ -94,20 +97,19 @@ data:
     if status != 200:
         print(f"ERROR: Failed to get admin token (HTTP {status}): {body}")
         sys.exit(1)
-    token = json.loads(body)["access_token"]
-    print(f"✓ Admin token obtained")
+    kc_token = json.loads(body)["access_token"]
+    print("✓ Keycloak admin token obtained")
 
-    # ── Step 2: Check if client already exists (idempotent) ───────────────────
+    # ── Step 2: Ensure Keycloak client exists (idempotent) ───────────────────
     status, _, body = http("GET",
         f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients?clientId={APP_NAME}",
-        token=token)
+        token=kc_token)
     existing = json.loads(body)
 
     if existing:
         internal_id = existing[0]["id"]
         print(f"✓ Client '{APP_NAME}' already exists (id: {internal_id})")
     else:
-        # ── Step 3: Create client ─────────────────────────────────────────────
         client_def = {
             "clientId": APP_NAME,
             "enabled": True,
@@ -119,55 +121,41 @@ data:
         }
         status, headers, body = http("POST",
             f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients",
-            data=client_def, token=token)
+            data=client_def, token=kc_token)
         if status not in (201, 200):
             print(f"ERROR: Failed to create client (HTTP {status}): {body}")
             sys.exit(1)
         internal_id = headers.get("Location", "").rstrip("/").split("/")[-1]
         print(f"✓ Created client '{APP_NAME}' (id: {internal_id})")
 
-    # ── Step 4: Get client secret ─────────────────────────────────────────────
+    # ── Step 3: Get client secret from Keycloak ───────────────────────────────
     status, _, body = http("GET",
         f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{internal_id}/client-secret",
-        token=token)
+        token=kc_token)
     if status != 200:
         print(f"ERROR: Failed to get client secret (HTTP {status}): {body}")
         sys.exit(1)
     client_secret = json.loads(body)["value"]
-    print(f"✓ Client secret retrieved")
+    print("✓ Client secret retrieved from Keycloak")
 
-    # ── Step 5: Write Secret using kubernetes Python client ───────────────────
-    # No kubectl binary needed — uses in-cluster ServiceAccount token
-    from kubernetes import client as k8s_client, config as k8s_config
-    k8s_config.load_incluster_config()
-    v1 = k8s_client.CoreV1Api()
-
-    secret_body = k8s_client.V1Secret(
-        metadata=k8s_client.V1ObjectMeta(
-            name=f"{APP_NAME}-oidc",
-            namespace=APP_NAMESPACE,
-            labels={"app.kubernetes.io/managed-by": "helmsman-oidc-registrar"}
-        ),
-        string_data={
-            "client-id":   APP_NAME,
+    # ── Step 4: Write to Vault KV v2 ─────────────────────────────────────────
+    # Path: secret/data/apps/<appname>/oidc
+    # ESO will sync this to a K8s Secret via ExternalSecret CRD
+    vault_payload = {
+        "data": {
+            "client-id":     APP_NAME,
             "client-secret": client_secret,
-            "issuer-url":  f"{KEYCLOAK_URL}/realms/{REALM}"
+            "issuer-url":    f"{KEYCLOAK_URL}/realms/{REALM}"
         }
-    )
-
-    try:
-        v1.read_namespaced_secret(f"{APP_NAME}-oidc", APP_NAMESPACE)
-        v1.replace_namespaced_secret(f"{APP_NAME}-oidc", APP_NAMESPACE, secret_body)
-        print(f"✓ Secret '{APP_NAME}-oidc' updated in namespace '{APP_NAMESPACE}'")
-    except k8s_client.exceptions.ApiException as e:
-        if e.status == 404:
-            v1.create_namespaced_secret(APP_NAMESPACE, secret_body)
-            print(f"✓ Secret '{APP_NAME}-oidc' created in namespace '{APP_NAMESPACE}'")
-        else:
-            print(f"ERROR writing Secret: {e}")
-            sys.exit(1)
-
-    print("✓ Registration complete.")
+    }
+    status, _, body = http("POST",
+        f"{VAULT_ADDR}/v1/secret/data/apps/{APP_NAME}/oidc",
+        data=vault_payload, vault_token=VAULT_TOKEN)
+    if status not in (200, 204):
+        print(f"ERROR: Failed to write to Vault (HTTP {status}): {body}")
+        sys.exit(1)
+    print(f"✓ OIDC credentials written to Vault at secret/data/apps/{APP_NAME}/oidc")
+    print("✓ Registration complete. ESO will sync to K8s Secret within 1h (or on next ExternalSecret refresh).")
 ---
 apiVersion: batch/v1
 kind: Job
@@ -186,12 +174,7 @@ spec:
       containers:
         - name: registrar
           image: python:3.12-slim
-          command:
-            - sh
-            - -c
-            - |
-              pip install kubernetes --quiet --no-cache-dir && \
-              python /scripts/register.py
+          command: ["python", "/scripts/register.py"]
           env:
             - name: APP_NAME
               value: {{ .Values.appName | quote }}
@@ -217,6 +200,16 @@ spec:
                 secretKeyRef:
                   name: helmsman-platform-config
                   key: keycloak-realm
+            - name: VAULT_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: helmsman-platform-config
+                  key: vault-url
+            - name: VAULT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: helmsman-platform-config
+                  key: vault-token
           volumeMounts:
             - name: script
               mountPath: /scripts
