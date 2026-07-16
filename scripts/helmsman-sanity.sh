@@ -418,17 +418,17 @@ EOF
         HUB_IP=$(docker inspect "$HUB_CONTAINER" --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
         if [ -n "$HUB_IP" ]; then
             fix "Updating helmsman-platform-config secret in spoke to point at Hub $HUB_IP"
-            kubectl --context "$SPOKE_CONTEXT" -n sample-app delete secret helmsman-platform-config 2>/dev/null || true
             if kubectl --context "$SPOKE_CONTEXT" -n sample-app create secret generic helmsman-platform-config \
                 --from-literal=keycloak-url="http://${HUB_IP}:30081" \
                 --from-literal=keycloak-admin-user=admin \
                 --from-literal=keycloak-admin-password=helmsman123 \
                 --from-literal=keycloak-realm=helmsman \
                 --from-literal=vault-url="http://${HUB_IP}:30082" \
-                --from-literal=vault-token=root > /dev/null 2>&1; then
-                ok "helmsman-platform-config created in spoke (keycloak-url=http://${HUB_IP}:30081, vault-url=http://${HUB_IP}:30082)"
+                --from-literal=vault-token=root \
+                --dry-run=client -o yaml | kubectl --context "$SPOKE_CONTEXT" -n sample-app apply --server-side --force-conflicts -f - > /dev/null 2>&1; then
+                ok "helmsman-platform-config applied in spoke (keycloak-url=http://${HUB_IP}:30081, vault-url=http://${HUB_IP}:30082)"
             else
-                fail "Failed to create helmsman-platform-config in spoke"
+                fail "Failed to apply helmsman-platform-config in spoke"
             fi
             # --- Ensure ExternalSecrets ClusterSecretStore can reach Vault via NodePort ---
             # Determine hub worker node IP(s) (NodePort listens on node interfaces)
