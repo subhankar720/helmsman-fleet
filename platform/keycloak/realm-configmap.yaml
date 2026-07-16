@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: helmsman-realm
+  namespace: keycloak
+data:
+  helmsman-realm.json: |
+    {
+      "realm": "helmsman",
+      "enabled": true,
+      "displayName": "Helmsman Platform",
+      "sslRequired": "external",
+      "registrationAllowed": false,
+      "loginWithEmailAllowed": true,
+      "bruteForceProtected": true,
+      "users": [
+        {
+          "username": "platform-admin",
+          "enabled": true,
+          "email": "platform-admin@helmsman.dev",
+          "credentials": [
+            {
+              "type": "password",
+              "value": "helmsman123",
+              "temporary": false
+            }
+          ],
+          "realmRoles": ["default-roles-helmsman"]
+        }
+      ]
+    }
