@@ -1,0 +1,223 @@
+{{- if .Values.oidc.enabled }}
+---
+# ServiceAccount for the registrar Job — needs permission to write Secrets
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.appName }}-oidc-registrar
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.appName }}-oidc-registrar
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.appName }}-oidc-registrar
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.appName }}-oidc-registrar
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.appName }}-oidc-registrar
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Values.appName }}-oidc-registrar-script
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+data:
+  register.py: |
+    #!/usr/bin/env python3
+    """
+    Helmsman OIDC Registrar
+    Idempotent: creates the Keycloak client if it doesn't exist,
+    then writes client_id + client_secret into a Kubernetes Secret.
+    Phase 2.3 upgrade: replace the kubectl Secret write with a Vault write.
+    """
+    import os, sys, json, subprocess
+    import urllib.request, urllib.parse, urllib.error
+
+    KEYCLOAK_URL  = os.environ["KEYCLOAK_URL"].rstrip("/")
+    ADMIN_USER    = os.environ["KEYCLOAK_ADMIN_USER"]
+    ADMIN_PASS    = os.environ["KEYCLOAK_ADMIN_PASSWORD"]
+    APP_NAME      = os.environ["APP_NAME"]
+    APP_NAMESPACE = os.environ["APP_NAMESPACE"]
+    REALM         = os.environ.get("KEYCLOAK_REALM", "helmsman")
+
+    def http(method, url, data=None, token=None):
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        if data and isinstance(data, dict):
+            data = json.dumps(data).encode()
+            headers["Content-Type"] = "application/json"
+        elif data and isinstance(data, str):
+            data = data.encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                body = resp.read().decode()
+                return resp.status, resp.headers, body
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read().decode()
+
+    # ── Step 1: Get admin token ───────────────────────────────────────────────
+    token_data = urllib.parse.urlencode({
+        "username": ADMIN_USER, "password": ADMIN_PASS,
+        "grant_type": "password", "client_id": "admin-cli"
+    })
+    status, _, body = http("POST",
+        f"{KEYCLOAK_URL}/realms/master/protocol/openid-connect/token",
+        data=token_data)
+    if status != 200:
+        print(f"ERROR: Failed to get admin token (HTTP {status}): {body}")
+        sys.exit(1)
+    token = json.loads(body)["access_token"]
+    print(f"✓ Admin token obtained")
+
+    # ── Step 2: Check if client already exists (idempotent) ───────────────────
+    status, _, body = http("GET",
+        f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients?clientId={APP_NAME}",
+        token=token)
+    existing = json.loads(body)
+
+    if existing:
+        internal_id = existing[0]["id"]
+        print(f"✓ Client '{APP_NAME}' already exists (id: {internal_id})")
+    else:
+        # ── Step 3: Create client ─────────────────────────────────────────────
+        client_def = {
+            "clientId": APP_NAME,
+            "enabled": True,
+            "publicClient": False,
+            "standardFlowEnabled": True,
+            "redirectUris": ["/*"],
+            "protocol": "openid-connect",
+            "attributes": {"helmsman.managed": "true"}
+        }
+        status, headers, body = http("POST",
+            f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients",
+            data=client_def, token=token)
+        if status not in (201, 200):
+            print(f"ERROR: Failed to create client (HTTP {status}): {body}")
+            sys.exit(1)
+        location = headers.get("Location", "")
+        internal_id = location.rstrip("/").split("/")[-1]
+        print(f"✓ Created client '{APP_NAME}' (id: {internal_id})")
+
+    # ── Step 4: Get client secret ─────────────────────────────────────────────
+    status, _, body = http("GET",
+        f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{internal_id}/client-secret",
+        token=token)
+    if status != 200:
+        print(f"ERROR: Failed to get client secret (HTTP {status}): {body}")
+        sys.exit(1)
+    client_secret = json.loads(body)["value"]
+    print(f"✓ Client secret retrieved")
+
+    # ── Step 5: Write to Kubernetes Secret ────────────────────────────────────
+    # Phase 2.3: replace this block with a Vault write
+    result = subprocess.run([
+        "kubectl", "create", "secret", "generic", f"{APP_NAME}-oidc",
+        f"--from-literal=client-id={APP_NAME}",
+        f"--from-literal=client-secret={client_secret}",
+        f"--from-literal=issuer-url={KEYCLOAK_URL}/realms/{REALM}",
+        f"--namespace={APP_NAMESPACE}",
+        "--dry-run=client", "-o", "yaml"
+    ], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"ERROR: kubectl dry-run failed: {result.stderr}")
+        sys.exit(1)
+    apply = subprocess.run(
+        ["kubectl", "apply", "-f", "-"],
+        input=result.stdout, capture_output=True, text=True
+    )
+    if apply.returncode != 0:
+        print(f"ERROR: kubectl apply failed: {apply.stderr}")
+        sys.exit(1)
+    print(f"✓ Secret '{APP_NAME}-oidc' written to namespace '{APP_NAMESPACE}'")
+    print("Registration complete.")
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Values.appName }}-oidc-register
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: {{ .Values.appName }}-oidc-registrar
+      restartPolicy: Never
+      containers:
+        - name: registrar
+          image: python:3.12-slim
+          command: ["python", "/scripts/register.py"]
+          env:
+            - name: APP_NAME
+              value: {{ .Values.appName | quote }}
+            - name: APP_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: KEYCLOAK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: helmsman-platform-config
+                  key: keycloak-url
+            - name: KEYCLOAK_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: helmsman-platform-config
+                  key: keycloak-admin-user
+            - name: KEYCLOAK_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: helmsman-platform-config
+                  key: keycloak-admin-password
+            - name: KEYCLOAK_REALM
+              valueFrom:
+                secretKeyRef:
+                  name: helmsman-platform-config
+                  key: keycloak-realm
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+      volumes:
+        - name: script
+          configMap:
+            name: {{ .Values.appName }}-oidc-registrar-script
+            defaultMode: 0755
+{{- end }}

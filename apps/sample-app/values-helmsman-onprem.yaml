@@ -22,7 +22,7 @@ resources:
     memory: "256Mi"
 
 oidc:
-  enabled: false
+  enabled: true
 
 replicas: 1
 
