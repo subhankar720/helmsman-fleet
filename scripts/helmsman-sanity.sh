@@ -471,7 +471,7 @@ EOF
                 fail "Service sample-app is missing in sample-app namespace"
             fi
             # Validate Hub Keycloak connectivity from spoke
-            if kubectl --context "$SPOKE_CONTEXT" -n default run --rm -i vault-keycloak-check --image=curlimages/curl:latest --restart=Never -- sh -c 'curl -sS --max-time 5 -o /dev/null -w "%{http_code}" http://${HUB_IP}:30081' 2>/dev/null | grep -Eq '^[23]..$'; then
+            if kubectl --context "$SPOKE_CONTEXT" -n default run --rm -i --restart=Never vault-keycloak-check --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' http://${HUB_IP}:30081" 2>/dev/null | grep -Eq '^[23][0-9][0-9]$'; then
                 ok "Keycloak HTTP endpoint reachable from spoke at http://${HUB_IP}:30081"
             else
                 fail "Keycloak http://${HUB_IP}:30081 not reachable from spoke"
@@ -486,7 +486,7 @@ EOF
                 info "Could not determine hub worker IP to expose Vault NodePort; skipping ClusterSecretStore patch"
             else
                 info "Testing reachability of Vault NodePort on $TARGET_IP:30082 from spoke cluster"
-                if kubectl --context "$SPOKE_CONTEXT" -n default run --rm -i --tty vault-check --image=curlimages/curl:latest --restart=Never -- curl -sS --max-time 5 http://${TARGET_IP}:30082/v1/sys/health -w '\nHTTP_CODE:%{http_code}\n' > /dev/null 2>&1; then
+                if kubectl --context "$SPOKE_CONTEXT" -n default run --rm -i --restart=Never vault-check --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 http://${TARGET_IP}:30082/v1/sys/health" > /dev/null 2>&1; then
                     ok "Vault NodePort reachable at ${TARGET_IP}:30082"
                     fix "Patching ClusterSecretStore 'vault-backend' in spoke to use http://${TARGET_IP}:30082"
                     kubectl --context "$SPOKE_CONTEXT" patch clustersecretstore vault-backend --type=merge -p "{\"spec\":{\"provider\":{\"vault\":{\"server\":\"http://${TARGET_IP}:30082\"}}}}" > /dev/null 2>&1 || true
