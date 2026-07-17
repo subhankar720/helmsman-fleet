@@ -467,11 +467,16 @@ EOF
                 else
                     fail "sample-app Service targetPort is not 4180 (got: $SERVICE_PORT)"
                 fi
+                if kubectl --context "$SPOKE_CONTEXT" -n sample-app run --rm --restart=Never sample-app-probe --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 http://sample-app:80/ping" > /dev/null 2>&1; then
+                    ok "OIDC sidecar /ping endpoint reachable through sample-app service"
+                else
+                    fail "OIDC sidecar /ping endpoint not reachable through sample-app service"
+                fi
             else
                 fail "Service sample-app is missing in sample-app namespace"
             fi
             # Validate Hub Keycloak connectivity from spoke
-            if kubectl --context "$SPOKE_CONTEXT" -n default run --rm -i --restart=Never vault-keycloak-check --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' http://${HUB_IP}:30081" 2>/dev/null | grep -Eq '^[23][0-9][0-9]$'; then
+            if kubectl --context "$SPOKE_CONTEXT" -n default run --rm --restart=Never vault-keycloak-check --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' http://${HUB_IP}:30081" 2>/dev/null | grep -Eq '^[23][0-9][0-9]$'; then
                 ok "Keycloak HTTP endpoint reachable from spoke at http://${HUB_IP}:30081"
             else
                 fail "Keycloak http://${HUB_IP}:30081 not reachable from spoke"
@@ -486,7 +491,7 @@ EOF
                 info "Could not determine hub worker IP to expose Vault NodePort; skipping ClusterSecretStore patch"
             else
                 info "Testing reachability of Vault NodePort on $TARGET_IP:30082 from spoke cluster"
-                if kubectl --context "$SPOKE_CONTEXT" -n default run --rm -i --restart=Never vault-check --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 http://${TARGET_IP}:30082/v1/sys/health" > /dev/null 2>&1; then
+                if kubectl --context "$SPOKE_CONTEXT" -n default run --rm --restart=Never vault-check --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 http://${TARGET_IP}:30082/v1/sys/health" > /dev/null 2>&1; then
                     ok "Vault NodePort reachable at ${TARGET_IP}:30082"
                     fix "Patching ClusterSecretStore 'vault-backend' in spoke to use http://${TARGET_IP}:30082"
                     kubectl --context "$SPOKE_CONTEXT" patch clustersecretstore vault-backend --type=merge -p "{\"spec\":{\"provider\":{\"vault\":{\"server\":\"http://${TARGET_IP}:30082\"}}}}" > /dev/null 2>&1 || true
