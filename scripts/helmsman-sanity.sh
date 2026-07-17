@@ -440,6 +440,42 @@ EOF
             else
                 fail "helmsman-platform-config validation failed: got keycloak-url=$ACTUAL_KEYCLOAK_URL vault-url=$ACTUAL_VAULT_URL"
             fi
+            if kubectl --context "$SPOKE_CONTEXT" -n sample-app get externalsecret sample-app-oidc > /dev/null 2>&1; then
+                ES_READY=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get externalsecret sample-app-oidc -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
+                if [ "$ES_READY" = "True" ]; then
+                    ok "ExternalSecret sample-app-oidc is Ready"
+                else
+                    fail "ExternalSecret sample-app-oidc is not Ready"
+                fi
+            else
+                fail "ExternalSecret sample-app-oidc is missing in sample-app namespace"
+            fi
+            if kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret sample-app-oidc > /dev/null 2>&1; then
+                SECRET_KEYS=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret sample-app-oidc -o jsonpath='{.data}' 2>/dev/null || echo "")
+                if echo "$SECRET_KEYS" | grep -q 'cookie-secret'; then
+                    ok "Secret sample-app-oidc exists and contains cookie-secret"
+                else
+                    fail "Secret sample-app-oidc exists but cookie-secret is missing"
+                fi
+            else
+                fail "Secret sample-app-oidc is missing in sample-app namespace"
+            fi
+            if kubectl --context "$SPOKE_CONTEXT" -n sample-app get svc sample-app > /dev/null 2>&1; then
+                SERVICE_PORT=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get svc sample-app -o jsonpath='{.spec.ports[0].targetPort}' 2>/dev/null || echo "")
+                if [ "$SERVICE_PORT" = "4180" ]; then
+                    ok "sample-app Service targetPort is 4180 for OIDC sidecar"
+                else
+                    fail "sample-app Service targetPort is not 4180 (got: $SERVICE_PORT)"
+                fi
+            else
+                fail "Service sample-app is missing in sample-app namespace"
+            fi
+            # Validate Hub Keycloak connectivity from spoke
+            if kubectl --context "$SPOKE_CONTEXT" -n default run --rm -i vault-keycloak-check --image=curlimages/curl:latest --restart=Never -- sh -c 'curl -sS --max-time 5 -o /dev/null -w "%{http_code}" http://${HUB_IP}:30081' 2>/dev/null | grep -Eq '^[23]..$'; then
+                ok "Keycloak HTTP endpoint reachable from spoke at http://${HUB_IP}:30081"
+            else
+                fail "Keycloak http://${HUB_IP}:30081 not reachable from spoke"
+            fi
             # --- Ensure ExternalSecrets ClusterSecretStore can reach Vault via NodePort ---
             # Determine hub worker node IP(s) (NodePort listens on node interfaces)
             HUB_WORKER_IP=$(docker inspect helmsman-hub-worker --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
