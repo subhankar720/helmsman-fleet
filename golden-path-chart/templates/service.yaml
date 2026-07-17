@@ -1,6 +1,4 @@
 # ── Headless Service ──────────────────────────────────────────────────────────
-# Required by StatefulSet for stable pod DNS.
-# Gives each pod a DNS entry: <pod>.<appName>-headless.<namespace>.svc.cluster.local
 apiVersion: v1
 kind: Service
 metadata:
@@ -18,9 +16,8 @@ spec:
       targetPort: http
 ---
 # ── Traffic Service ───────────────────────────────────────────────────────────
-# The actual entrypoint for traffic into the application.
-# Phase 1: ClusterIP (internal only).
-# Phase 2+: when oidc.enabled=true, traffic hits oauth2-proxy port (4180) first.
+# When OIDC is enabled: exposes port 4180 (oauth2-proxy/ADC) — never the app port directly.
+# When OIDC is disabled: exposes the app port directly.
 apiVersion: v1
 kind: Service
 metadata:
@@ -35,5 +32,9 @@ spec:
   ports:
     - name: http
       port: 80
+      {{- if .Values.oidc.enabled }}
+      targetPort: 4180
+      {{- else }}
       targetPort: http
+      {{- end }}
       protocol: TCP

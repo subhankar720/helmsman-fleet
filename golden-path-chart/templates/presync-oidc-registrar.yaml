@@ -51,12 +51,11 @@ data:
   register.py: |
     #!/usr/bin/env python3
     """
-    Helmsman OIDC Registrar — v3
-    Writes OIDC client credentials to Vault (KV v2).
-    ESO then syncs them into a K8s Secret in the app namespace.
-    The pod never talks to Vault directly — it just reads a mounted Secret.
+    Helmsman OIDC Registrar — v4
+    Writes OIDC client credentials + oauth2-proxy cookie secret to Vault KV v2.
+    ESO syncs them into a K8s Secret that the oauth2-proxy (ADC) sidecar mounts.
     """
-    import os, sys, json
+    import os, sys, json, secrets, base64
     import urllib.request, urllib.parse, urllib.error
 
     KEYCLOAK_URL  = os.environ["KEYCLOAK_URL"].rstrip("/")
@@ -115,7 +114,8 @@ data:
             "enabled": True,
             "publicClient": False,
             "standardFlowEnabled": True,
-            "redirectUris": ["/*"],
+            "redirectUris": ["*"],
+            "webOrigins": ["+"],
             "protocol": "openid-connect",
             "attributes": {"helmsman.managed": "true"}
         }
@@ -128,7 +128,15 @@ data:
         internal_id = headers.get("Location", "").rstrip("/").split("/")[-1]
         print(f"✓ Created client '{APP_NAME}' (id: {internal_id})")
 
-    # ── Step 3: Get client secret from Keycloak ───────────────────────────────
+    # ── Step 3: Update redirectUris to be fully permissive for dev ────────────
+    status, _, _ = http("PUT",
+        f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{internal_id}",
+        data={"clientId": APP_NAME, "redirectUris": ["*"], "webOrigins": ["+"],
+              "enabled": True, "publicClient": False, "standardFlowEnabled": True,
+              "protocol": "openid-connect"},
+        token=kc_token)
+
+    # ── Step 4: Get client secret ─────────────────────────────────────────────
     status, _, body = http("GET",
         f"{KEYCLOAK_URL}/admin/realms/{REALM}/clients/{internal_id}/client-secret",
         token=kc_token)
@@ -138,14 +146,30 @@ data:
     client_secret = json.loads(body)["value"]
     print("✓ Client secret retrieved from Keycloak")
 
-    # ── Step 4: Write to Vault KV v2 ─────────────────────────────────────────
-    # Path: secret/data/apps/<appname>/oidc
-    # ESO will sync this to a K8s Secret via ExternalSecret CRD
+    # ── Step 5: Check if cookie secret already exists in Vault ────────────────
+    # Keep the existing cookie secret if it does — rotating it invalidates sessions
+    status, _, body = http("GET",
+        f"{VAULT_ADDR}/v1/secret/data/apps/{APP_NAME}/oidc",
+        vault_token=VAULT_TOKEN)
+    if status == 200:
+        existing_data = json.loads(body).get("data", {}).get("data", {})
+        cookie_secret = existing_data.get("cookie-secret", "")
+        if cookie_secret:
+            print("✓ Existing cookie secret preserved")
+        else:
+            cookie_secret = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
+            print("✓ New cookie secret generated")
+    else:
+        cookie_secret = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode()
+        print("✓ New cookie secret generated")
+
+    # ── Step 6: Write everything to Vault KV v2 ───────────────────────────────
     vault_payload = {
         "data": {
             "client-id":     APP_NAME,
             "client-secret": client_secret,
-            "issuer-url":    f"{KEYCLOAK_URL}/realms/{REALM}"
+            "issuer-url":    f"{KEYCLOAK_URL}/realms/{REALM}",
+            "cookie-secret": cookie_secret
         }
     }
     status, _, body = http("POST",
@@ -154,8 +178,8 @@ data:
     if status not in (200, 204):
         print(f"ERROR: Failed to write to Vault (HTTP {status}): {body}")
         sys.exit(1)
-    print(f"✓ OIDC credentials written to Vault at secret/data/apps/{APP_NAME}/oidc")
-    print("✓ Registration complete. ESO will sync to K8s Secret within 1h (or on next ExternalSecret refresh).")
+    print(f"✓ All OIDC credentials written to Vault at secret/data/apps/{APP_NAME}/oidc")
+    print("✓ Registration complete.")
 ---
 apiVersion: batch/v1
 kind: Job

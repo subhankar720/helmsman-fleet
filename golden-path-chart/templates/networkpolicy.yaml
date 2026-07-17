@@ -1,6 +1,3 @@
-# ── Default deny ──────────────────────────────────────────────────────────────
-# Every app pod starts with all ingress and egress blocked.
-# Subsequent policies below open only what's needed.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -16,7 +13,6 @@ spec:
     - Ingress
     - Egress
 ---
-# ── Allow ingress on app port ─────────────────────────────────────────────────
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -30,13 +26,16 @@ spec:
       {{- include "golden-path-chart.selectorLabels" . | nindent 6 }}
   ingress:
     - ports:
+        {{- if .Values.oidc.enabled }}
+        - port: 4180
+          protocol: TCP
+        {{- else }}
         - port: {{ .Values.container.port }}
           protocol: TCP
+        {{- end }}
   policyTypes:
     - Ingress
 ---
-# ── Allow DNS egress ──────────────────────────────────────────────────────────
-# Without this, the app container cannot resolve any hostname.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -53,6 +52,13 @@ spec:
         - port: 53
           protocol: UDP
         - port: 53
+          protocol: TCP
+    # Allow egress to Keycloak for OIDC token validation
+    - ports:
+        - port: 30081
+          protocol: TCP
+    - ports:
+        - port: 8080
           protocol: TCP
   policyTypes:
     - Egress
