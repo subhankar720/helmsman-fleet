@@ -1,0 +1,64 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-kyverno
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://kyverno.github.io/kyverno/
+    chart: kyverno
+    targetRevision: "3.3.7"
+    helm:
+      values: |
+        # Admission controller — the core webhook that enforces policies
+        admissionController:
+          replicas: 1
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "384Mi"
+        # Background controller — audits existing resources against policies
+        backgroundController:
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+        # Cleanup controller — handles TTL-based resource cleanup
+        cleanupController:
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+        # Reports controller — generates policy reports
+        reportsController:
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+        # IMPORTANT for dev: if Kyverno is unavailable, allow pods through
+        # rather than blocking all pod creation. Never use Ignore in production.
+        webhooksCleanup:
+          enabled: true
+  destination:
+    server: https://172.18.0.3:6443
+    namespace: kyverno
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

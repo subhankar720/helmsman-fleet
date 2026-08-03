@@ -1,0 +1,29 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-helmsman-labels
+  annotations:
+    policies.kyverno.io/title: Require Helmsman Managed Labels
+    policies.kyverno.io/description: >
+      All pods in Helmsman-managed namespaces must carry the
+      app.kubernetes.io/managed-by: helmsman label. This ensures
+      every workload is traceable to the platform and visible in
+      cost allocation and audit queries.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-managed-by-label
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaceSelector:
+                matchLabels:
+                  helmsman.dev/managed: "true"
+      validate:
+        message: "Pods must have label app.kubernetes.io/managed-by: helmsman"
+        pattern:
+          metadata:
+            labels:
+              app.kubernetes.io/managed-by: helmsman
