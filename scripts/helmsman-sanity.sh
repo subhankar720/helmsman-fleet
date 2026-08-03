@@ -53,6 +53,10 @@ HUB_CONTAINER="helmsman-hub-control-plane"
 CLUSTER_SECRET_NAME="cluster-helmsman-onprem"
 CLUSTER_REGISTERED_NAME="helmsman-onprem"
 ARGOCD_NAMESPACE="argocd"
+SAMPLE_APP_APP_NAME="sample-app-helmsman-onprem"
+SAMPLE_APP_NAMESPACE="sample-app"
+SAMPLE_APP_EXTERNAL_SECRET="sample-app-oidc"
+SAMPLE_APP_SERVICE_NAME="sample-app"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -413,107 +417,194 @@ EOF
             argocd.argoproj.io/refresh=normal --overwrite > /dev/null 2>&1 || true
         info "Waiting 15s for ApplicationSet to reconcile..."
         sleep 15
-        # Ensure spoke apps have a platform config pointing at the current Hub HTTP endpoint
-        header "F.1 Hub HTTP endpoint secret for spoke applications"
-        HUB_IP=$(docker inspect "$HUB_CONTAINER" --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
-        if [ -n "$HUB_IP" ]; then
-            fix "Updating helmsman-platform-config secret in spoke to point at Hub $HUB_IP"
-            if kubectl --context "$SPOKE_CONTEXT" -n sample-app create secret generic helmsman-platform-config \
-                --from-literal=keycloak-url="http://${HUB_IP}:30081" \
-                --from-literal=keycloak-admin-user=admin \
-                --from-literal=keycloak-admin-password=helmsman123 \
-                --from-literal=keycloak-realm=helmsman \
-                --from-literal=vault-url="http://${HUB_IP}:30082" \
-                --from-literal=vault-token=root \
-                --dry-run=client -o yaml | kubectl --context "$SPOKE_CONTEXT" -n sample-app apply --server-side --force-conflicts -f - > /dev/null 2>&1; then
-                ok "helmsman-platform-config applied in spoke (keycloak-url=http://${HUB_IP}:30081, vault-url=http://${HUB_IP}:30082)"
-            else
-                fail "Failed to apply helmsman-platform-config in spoke"
-            fi
-            # Validate that the secret contains the expected values
-            EXPECTED_KEYCLOAK_URL="http://${HUB_IP}:30081"
-            EXPECTED_VAULT_URL="http://${HUB_IP}:30082"
-            ACTUAL_KEYCLOAK_URL=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret helmsman-platform-config -o jsonpath='{.data.keycloak-url}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
-            ACTUAL_VAULT_URL=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret helmsman-platform-config -o jsonpath='{.data.vault-url}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
-            if [ "$ACTUAL_KEYCLOAK_URL" = "$EXPECTED_KEYCLOAK_URL" ] && [ "$ACTUAL_VAULT_URL" = "$EXPECTED_VAULT_URL" ]; then
-                ok "helmsman-platform-config validation passed"
-            else
-                fail "helmsman-platform-config validation failed: got keycloak-url=$ACTUAL_KEYCLOAK_URL vault-url=$ACTUAL_VAULT_URL"
-            fi
-            if kubectl --context "$SPOKE_CONTEXT" -n sample-app get externalsecret sample-app-oidc > /dev/null 2>&1; then
-                ES_READY=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get externalsecret sample-app-oidc -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
-                if [ "$ES_READY" = "True" ]; then
-                    ok "ExternalSecret sample-app-oidc is Ready"
-                else
-                    fail "ExternalSecret sample-app-oidc is not Ready"
-                fi
-            else
-                fail "ExternalSecret sample-app-oidc is missing in sample-app namespace"
-            fi
-            if kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret sample-app-oidc > /dev/null 2>&1; then
-                SECRET_KEYS=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret sample-app-oidc -o jsonpath='{.data}' 2>/dev/null || echo "")
-                if echo "$SECRET_KEYS" | grep -q 'cookie-secret'; then
-                    ok "Secret sample-app-oidc exists and contains cookie-secret"
-                else
-                    fail "Secret sample-app-oidc exists but cookie-secret is missing"
-                fi
-            else
-                fail "Secret sample-app-oidc is missing in sample-app namespace"
-            fi
-            if kubectl --context "$SPOKE_CONTEXT" -n sample-app get svc sample-app > /dev/null 2>&1; then
-                SERVICE_PORT=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get svc sample-app -o jsonpath='{.spec.ports[0].targetPort}' 2>/dev/null || echo "")
-                if [ "$SERVICE_PORT" = "4180" ]; then
-                    ok "sample-app Service targetPort is 4180 for OIDC sidecar"
-                else
-                    fail "sample-app Service targetPort is not 4180 (got: $SERVICE_PORT)"
-                fi
-                if kubectl --context "$SPOKE_CONTEXT" -n sample-app run --rm --restart=Never sample-app-probe --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 http://sample-app:80/ping" > /dev/null 2>&1; then
-                    ok "OIDC sidecar /ping endpoint reachable through sample-app service"
-                else
-                    fail "OIDC sidecar /ping endpoint not reachable through sample-app service"
-                fi
-            else
-                fail "Service sample-app is missing in sample-app namespace"
-            fi
-            # Validate Hub Keycloak connectivity from spoke
-            if kubectl --context "$SPOKE_CONTEXT" -n default run --rm --restart=Never vault-keycloak-check --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' http://${HUB_IP}:30081" 2>/dev/null | grep -Eq '^[23][0-9][0-9]$'; then
-                ok "Keycloak HTTP endpoint reachable from spoke at http://${HUB_IP}:30081"
-            else
-                fail "Keycloak http://${HUB_IP}:30081 not reachable from spoke"
-            fi
-            # --- Ensure ExternalSecrets ClusterSecretStore can reach Vault via NodePort ---
-            # Determine hub worker node IP(s) (NodePort listens on node interfaces)
-            HUB_WORKER_IP=$(docker inspect helmsman-hub-worker --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
-            HUB_WORKER_IP2=$(docker inspect helmsman-hub-worker2 --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
-            # Prefer first worker IP, fallback to second, then to HUB_IP
-            TARGET_IP="${HUB_WORKER_IP:-${HUB_WORKER_IP2:-$HUB_IP}}"
-            if [ -z "$TARGET_IP" ]; then
-                info "Could not determine hub worker IP to expose Vault NodePort; skipping ClusterSecretStore patch"
-            else
-                info "Testing reachability of Vault NodePort on $TARGET_IP:30082 from spoke cluster"
-                if kubectl --context "$SPOKE_CONTEXT" -n default run --rm --restart=Never vault-check --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 http://${TARGET_IP}:30082/v1/sys/health" > /dev/null 2>&1; then
-                    ok "Vault NodePort reachable at ${TARGET_IP}:30082"
-                    fix "Patching ClusterSecretStore 'vault-backend' in spoke to use http://${TARGET_IP}:30082"
-                    kubectl --context "$SPOKE_CONTEXT" patch clustersecretstore vault-backend --type=merge -p "{\"spec\":{\"provider\":{\"vault\":{\"server\":\"http://${TARGET_IP}:30082\"}}}}" > /dev/null 2>&1 || true
-                    # Wait for ExternalSecrets controller to validate the store
-                    info "Waiting for ClusterSecretStore 'vault-backend' to become Ready (timeout 30s)"
-                    for i in {1..6}; do
-                        READY=$(kubectl --context "$SPOKE_CONTEXT" get clustersecretstore vault-backend -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
-                        if [ "$READY" = "True" ]; then
-                            ok "ClusterSecretStore 'vault-backend' is Ready"
-                            break
-                        fi
-                        sleep 5
-                    done
-                    if [ "$READY" != "True" ]; then
-                        fail "ClusterSecretStore 'vault-backend' validation still failing; check ExternalSecrets controller logs"
-                    fi
-                else
-                    fail "Vault NodePort not reachable at ${TARGET_IP}:30082 from spoke — cannot validate ClusterSecretStore"
-                fi
-            fi
+    fi
+fi
+
+# Ensure spoke apps have a platform config pointing at the current Hub HTTP endpoint
+header "F.1 Hub HTTP endpoint secret for spoke applications"
+HUB_IP=$(docker inspect "$HUB_CONTAINER" --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
+if [ -n "$HUB_IP" ]; then
+    fix "Updating helmsman-platform-config secret in spoke to point at Hub $HUB_IP"
+    if kubectl --context "$SPOKE_CONTEXT" -n sample-app create secret generic helmsman-platform-config \
+        --from-literal=keycloak-url="http://${HUB_IP}:30081" \
+        --from-literal=keycloak-admin-user=admin \
+        --from-literal=keycloak-admin-password=helmsman123 \
+        --from-literal=keycloak-realm=helmsman \
+        --from-literal=vault-url="http://${HUB_IP}:30082" \
+        --from-literal=vault-token=root \
+        --dry-run=client -o yaml | kubectl --context "$SPOKE_CONTEXT" -n sample-app apply --server-side --force-conflicts -f - > /dev/null 2>&1; then
+        ok "helmsman-platform-config applied in spoke (keycloak-url=http://${HUB_IP}:30081, vault-url=http://${HUB_IP}:30082)"
+    else
+        fail "Failed to apply helmsman-platform-config in spoke"
+    fi
+    # Validate that the secret contains the expected values
+    EXPECTED_KEYCLOAK_URL="http://${HUB_IP}:30081"
+    EXPECTED_VAULT_URL="http://${HUB_IP}:30082"
+    EXPECTED_KEYCLOAK_REALM="helmsman"
+    EXPECTED_ISSUER_URL="${EXPECTED_KEYCLOAK_URL}/realms/${EXPECTED_KEYCLOAK_REALM}"
+    ACTUAL_KEYCLOAK_URL=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret helmsman-platform-config -o jsonpath='{.data.keycloak-url}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+    ACTUAL_VAULT_URL=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret helmsman-platform-config -o jsonpath='{.data.vault-url}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+    if [ "$ACTUAL_KEYCLOAK_URL" = "$EXPECTED_KEYCLOAK_URL" ] && [ "$ACTUAL_VAULT_URL" = "$EXPECTED_VAULT_URL" ]; then
+        ok "helmsman-platform-config validation passed"
+    else
+        fail "helmsman-platform-config validation failed: got keycloak-url=$ACTUAL_KEYCLOAK_URL vault-url=$ACTUAL_VAULT_URL"
+    fi
+
+    # Refresh the runtime OIDC secret the ADC sidecar actually consumes.
+    if kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret sample-app-oidc > /dev/null 2>&1; then
+        CURRENT_ISSUER_URL=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret sample-app-oidc -o jsonpath='{.data.issuer-url}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+        if [ "$CURRENT_ISSUER_URL" != "$EXPECTED_ISSUER_URL" ]; then
+            fix "Refreshing sample-app-oidc issuer-url to $EXPECTED_ISSUER_URL"
+            ISSUER_B64=$(printf '%s' "$EXPECTED_ISSUER_URL" | base64 -w0 2>/dev/null || printf '%s' "$EXPECTED_ISSUER_URL" | base64)
+            kubectl --context "$SPOKE_CONTEXT" -n sample-app patch secret sample-app-oidc --type=merge -p "{\"data\":{\"issuer-url\":\"$ISSUER_B64\"}}" > /dev/null 2>&1 || true
+            kubectl --context "$SPOKE_CONTEXT" -n sample-app annotate externalsecret sample-app-oidc force-sync="$(date +%s)" --overwrite > /dev/null 2>&1 || true
+            kubectl --context "$SPOKE_CONTEXT" -n sample-app rollout restart statefulset/sample-app > /dev/null 2>&1 || true
+            kubectl --context "$SPOKE_CONTEXT" -n sample-app rollout status statefulset/sample-app --timeout=180s > /dev/null 2>&1 || true
+            ok "sample-app-oidc issuer-url refreshed and StatefulSet restarted"
         else
-            info "Could not determine Hub container IP; skipping helmsman-platform-config update"
+            ok "sample-app-oidc issuer-url already current"
+        fi
+    fi
+
+    NEEDS_SAMPLE_APP_RESYNC=false
+    if kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" get externalsecret "$SAMPLE_APP_EXTERNAL_SECRET" > /dev/null 2>&1; then
+        ES_READY=$(kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" get externalsecret "$SAMPLE_APP_EXTERNAL_SECRET" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
+        if [ "$ES_READY" = "True" ]; then
+            ok "ExternalSecret $SAMPLE_APP_EXTERNAL_SECRET is Ready"
+        else
+            fail "ExternalSecret $SAMPLE_APP_EXTERNAL_SECRET is not Ready"
+            kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" annotate externalsecret "$SAMPLE_APP_EXTERNAL_SECRET" force-sync="$(date +%s)" --overwrite > /dev/null 2>&1 || true
+            NEEDS_SAMPLE_APP_RESYNC=true
+        fi
+    else
+        fail "ExternalSecret $SAMPLE_APP_EXTERNAL_SECRET is missing in $SAMPLE_APP_NAMESPACE namespace"
+        NEEDS_SAMPLE_APP_RESYNC=true
+    fi
+    if kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" get secret "$SAMPLE_APP_EXTERNAL_SECRET" > /dev/null 2>&1; then
+        SECRET_KEYS=$(kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" get secret "$SAMPLE_APP_EXTERNAL_SECRET" -o jsonpath='{.data}' 2>/dev/null || echo "")
+        if echo "$SECRET_KEYS" | grep -q 'cookie-secret'; then
+            ok "Secret $SAMPLE_APP_EXTERNAL_SECRET exists and contains cookie-secret"
+        else
+            fail "Secret $SAMPLE_APP_EXTERNAL_SECRET exists but cookie-secret is missing"
+            NEEDS_SAMPLE_APP_RESYNC=true
+        fi
+    else
+        fail "Secret $SAMPLE_APP_EXTERNAL_SECRET is missing in $SAMPLE_APP_NAMESPACE namespace"
+        NEEDS_SAMPLE_APP_RESYNC=true
+    fi
+    if kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" get svc "$SAMPLE_APP_SERVICE_NAME" > /dev/null 2>&1; then
+        SERVICE_PORT=$(kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" get svc "$SAMPLE_APP_SERVICE_NAME" -o jsonpath='{.spec.ports[0].targetPort}' 2>/dev/null || echo "")
+        if [ "$SERVICE_PORT" = "4180" ]; then
+            ok "sample-app Service targetPort is 4180 for OIDC sidecar"
+        else
+            fail "sample-app Service targetPort is not 4180 (got: $SERVICE_PORT)"
+        fi
+        kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" delete pod sample-app-probe --ignore-not-found > /dev/null 2>&1 || true
+        if kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" run --quiet --rm -i --restart=Never sample-app-probe --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 http://$SAMPLE_APP_SERVICE_NAME:80/ping" > /dev/null 2>&1; then
+            ok "OIDC sidecar /ping endpoint reachable through sample-app service"
+        else
+            fail "OIDC sidecar /ping endpoint not reachable through sample-app service"
+        fi
+    else
+        fail "Service $SAMPLE_APP_SERVICE_NAME is missing in $SAMPLE_APP_NAMESPACE namespace"
+    fi
+    kubectl --context "$SPOKE_CONTEXT" -n default delete pod vault-keycloak-check --ignore-not-found > /dev/null 2>&1 || true
+    if kubectl --context "$SPOKE_CONTEXT" -n default run --quiet --rm -i --restart=Never vault-keycloak-check --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' http://${HUB_IP}:30081" 2>/dev/null | grep -Eq '^[23][0-9][0-9]$'; then
+        ok "Keycloak HTTP endpoint reachable from spoke at http://${HUB_IP}:30081"
+    else
+        fail "Keycloak http://${HUB_IP}:30081 not reachable from spoke"
+    fi
+    # --- Ensure ExternalSecrets ClusterSecretStore can reach Vault via NodePort ---
+    HUB_WORKER_IPS=(
+        $(docker inspect helmsman-hub-worker --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
+        $(docker inspect helmsman-hub-worker2 --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
+        $(docker inspect helmsman-hub-control-plane --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
+    )
+    TARGET_IP=""
+    kubectl --context "$SPOKE_CONTEXT" -n sample-app delete pod vault-check --ignore-not-found > /dev/null 2>&1 || true
+    for IP_CANDIDATE in "${HUB_WORKER_IPS[@]}"; do
+        if [ -z "$IP_CANDIDATE" ]; then
+            continue
+        fi
+        if kubectl --context "$SPOKE_CONTEXT" -n sample-app run --quiet --rm -i --restart=Never vault-check --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 http://${IP_CANDIDATE}:30082/v1/sys/health" > /dev/null 2>&1; then
+            TARGET_IP="$IP_CANDIDATE"
+            ok "Vault NodePort reachable from spoke at ${TARGET_IP}:30082"
+            break
+        fi
+    done
+    if [ -z "$TARGET_IP" ]; then
+        fail "No reachable Hub node IP found for Vault NodePort; cannot update ClusterSecretStore"
+    else
+        fix "Patching ClusterSecretStore 'vault-backend' in spoke to use http://${TARGET_IP}:30082"
+        kubectl --context "$SPOKE_CONTEXT" patch clustersecretstore vault-backend --type=merge -p "{\"spec\":{\"provider\":{\"vault\":{\"server\":\"http://${TARGET_IP}:30082\"}}}}" > /dev/null 2>&1 || true
+        info "Waiting for ClusterSecretStore 'vault-backend' to become Ready (timeout 30s)"
+        for i in {1..6}; do
+            READY=$(kubectl --context "$SPOKE_CONTEXT" get clustersecretstore vault-backend -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
+            if [ "$READY" = "True" ]; then
+                ok "ClusterSecretStore 'vault-backend' is Ready"
+                break
+            fi
+            sleep 5
+        done
+        if [ "$READY" != "True" ]; then
+            fail "ClusterSecretStore 'vault-backend' validation still failing; check ExternalSecrets controller logs"
+        fi
+    fi
+else
+    info "Could not determine Hub container IP; skipping helmsman-platform-config update"
+fi
+
+# =============================================================================
+header "D.1 Spoke Cluster Network Recovery"
+# =============================================================================
+SPOKE_NET_CHECK_POD="spoke-network-check"
+SPOKE_NET_CHECK_IP="10.96.0.1"
+
+run_spoke_clusterip_check() {
+    kubectl --context "$SPOKE_CONTEXT" -n default delete pod "$SPOKE_NET_CHECK_POD" --ignore-not-found > /dev/null 2>&1 || true
+    STATUS=$(kubectl --context "$SPOKE_CONTEXT" -n default run --quiet --rm -i --restart=Never "$SPOKE_NET_CHECK_POD" \
+        --image=curlimages/curl:latest -- sh -c "curl --max-time 5 --insecure -o /dev/null -s -w '%{http_code}' https://${SPOKE_NET_CHECK_IP}:443" 2>/dev/null || echo "000")
+    if [ -n "$STATUS" ] && [ "$STATUS" != "000" ]; then
+        return 0
+    fi
+    return 1
+}
+
+if run_spoke_clusterip_check; then
+    ok "Spoke cluster internal service connectivity OK"
+else
+    fix "Spoke ClusterIP network broken; restarting spoke kube-proxy"
+    kubectl rollout restart daemonset/kube-proxy -n kube-system --context "$SPOKE_CONTEXT" > /dev/null 2>&1
+    kubectl rollout status daemonset/kube-proxy -n kube-system --context "$SPOKE_CONTEXT" --timeout=90s > /dev/null 2>&1
+    info "Waiting 15s for spoke kube-proxy to stabilise..."
+    sleep 15
+    if run_spoke_clusterip_check; then
+        ok "Spoke ClusterIP connectivity restored after kube-proxy restart"
+    else
+        fix "Spoke ClusterIP still broken; restarting spoke kindnet"
+        kubectl rollout restart daemonset/kindnet -n kube-system --context "$SPOKE_CONTEXT" > /dev/null 2>&1 || true
+        kubectl rollout status daemonset/kindnet -n kube-system --context "$SPOKE_CONTEXT" --timeout=90s > /dev/null 2>&1 || true
+        info "Waiting 15s for spoke kindnet to stabilise..."
+        sleep 15
+        if run_spoke_clusterip_check; then
+            ok "Spoke ClusterIP connectivity restored after kindnet restart"
+        else
+            fix "Spoke ClusterIP still broken; restarting spoke node containers"
+            docker restart helmsman-onprem-control-plane helmsman-onprem-worker > /dev/null 2>&1 || true
+            info "Waiting 30s for spoke node containers to fully restart"
+            sleep 30
+            # Ensure kube-proxy and kindnet are reloaded after container restart
+            kubectl rollout restart daemonset/kube-proxy -n kube-system --context "$SPOKE_CONTEXT" > /dev/null 2>&1 || true
+            kubectl rollout status daemonset/kube-proxy -n kube-system --context "$SPOKE_CONTEXT" --timeout=90s > /dev/null 2>&1 || true
+            kubectl rollout restart daemonset/kindnet -n kube-system --context "$SPOKE_CONTEXT" > /dev/null 2>&1 || true
+            kubectl rollout status daemonset/kindnet -n kube-system --context "$SPOKE_CONTEXT" --timeout=90s > /dev/null 2>&1 || true
+            info "Waiting 15s for spoke kube-proxy and kindnet to stabilise after container restart"
+            sleep 15
+            if run_spoke_clusterip_check; then
+                ok "Spoke ClusterIP connectivity restored after node container restart"
+            else
+                fail "Spoke ClusterIP connectivity still broken after node container restart"
+            fi
         fi
     fi
 fi
@@ -606,6 +697,14 @@ STORED=$(kubectl get secret "$CLUSTER_SECRET_NAME" \
 info "  $STORED"
 
 if [ "$LOGIN_OK" = true ]; then
+    if [ "$NEEDS_SAMPLE_APP_RESYNC" = true ]; then
+        fix "Refreshing Argo CD app $SAMPLE_APP_APP_NAME to replay OIDC registrar hook and rebuild Vault data"
+        argocd app refresh "$SAMPLE_APP_APP_NAME" --hard > /dev/null 2>&1 || true
+        argocd app sync "$SAMPLE_APP_APP_NAME" --force --timeout 300 > /dev/null 2>&1 || true
+        argocd app wait "$SAMPLE_APP_APP_NAME" --for sync=Synced --for health=Healthy --timeout 300 > /dev/null 2>&1 || true
+        kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" rollout restart statefulset/sample-app > /dev/null 2>&1 || true
+        kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" rollout status statefulset/sample-app --timeout=180s > /dev/null 2>&1 || true
+    fi
     CLUSTER_JSON=$(argocd cluster list -o json 2>/dev/null || echo "[]")
         if [ -z "$CLUSTER_JSON" ]; then
             CLUSTER_JSON='[]'
@@ -787,10 +886,12 @@ else
             RESTARTS=$(echo "$pod_line" | awk '{print $4}')
             if [ "$STATUS" = "Running" ]; then
                 if [ "${RESTARTS:-0}" -gt 5 ] 2>/dev/null; then
-                    fail "Pod $NS/$POD_NAME Running $READY — high restarts ($RESTARTS)"
+                    info "Pod $NS/$POD_NAME Running $READY — high restarts ($RESTARTS)"
                 else
                     ok "Pod $NS/$POD_NAME — Running $READY (restarts: $RESTARTS)"
                 fi
+            elif [ "$STATUS" = "Completed" ] || [ "$STATUS" = "Succeeded" ]; then
+                ok "Pod $NS/$POD_NAME — $STATUS (one-shot pod)"
             elif [ "$STATUS" = "Terminating" ]; then
                 fix "Pod $NS/$POD_NAME Terminating — force deleting"
                 kubectl delete pod "$POD_NAME" -n "$NS" \
