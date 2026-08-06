@@ -48,12 +48,15 @@ spec:
             limits:
               cpu: "200m"
               memory: "128Mi"
+        policyReportsCleanup:
+          image:
+            tag: latest
         # IMPORTANT for dev: if Kyverno is unavailable, allow pods through
         # rather than blocking all pod creation. Never use Ignore in production.
         webhooksCleanup:
           enabled: true
   destination:
-    server: https://172.18.0.3:6443
+    server: https://kubernetes.default.svc
     namespace: kyverno
   syncPolicy:
     automated:

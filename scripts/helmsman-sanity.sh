@@ -398,20 +398,33 @@ EOF
             -o jsonpath="{range .items[?(@.spec.destination.server=='https://${OLD_IP}:6443')]}{.metadata.name}{'\n'}{end}" \
             2>/dev/null || echo "")
 
+        PATCHED_APPS=""
         if [ -n "$STALE_APPS" ]; then
             for APP in $STALE_APPS; do
                 fix "Patching Application $APP: $OLD_IP → $SPOKE_IP"
-                kubectl patch application "$APP" \
+                if kubectl patch application "$APP" \
                     -n argocd --context "$HUB_CONTEXT" \
                     --type=merge \
                     -p "{\"spec\":{\"destination\":{\"server\":\"https://${SPOKE_IP}:6443\"}}}" \
-                    > /dev/null 2>&1 && ok "Patched: $APP" || fail "Failed to patch: $APP"
+                    > /dev/null 2>&1; then
+                    ok "Patched: $APP"
+                    PATCHED_APPS="$PATCHED_APPS $APP"
+                else
+                    fail "Failed to patch: $APP"
+                fi
             done
         else
             info "No stale Applications to patch"
         fi
 
-        # Trigger ApplicationSet reconcile
+        # Trigger refresh for patched apps and ApplicationSet reconcile
+        for APP in $PATCHED_APPS; do
+            kubectl annotate application "$APP" \
+                -n argocd --context "$HUB_CONTEXT" \
+                argocd.argoproj.io/refresh=normal --overwrite > /dev/null 2>&1 || true
+            info "Annotated patched application $APP for refresh"
+        done
+
         kubectl annotate applicationset helmsman-apps \
             -n argocd --context "$HUB_CONTEXT" \
             argocd.argoproj.io/refresh=normal --overwrite > /dev/null 2>&1 || true
