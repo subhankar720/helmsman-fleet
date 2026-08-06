@@ -1,0 +1,36 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signatures
+  annotations:
+    policies.kyverno.io/title: Verify Image Signatures
+    policies.kyverno.io/description: >
+      All images from ghcr.io/subhankar720 must be signed with the
+      Helmsman project cosign key. An unsigned image means it never
+      passed the CI pipeline (Trivy scan + cosign sign). Unsigned
+      images are rejected before the pod is admitted to the cluster.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: verify-helmsman-app-signature
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaceSelector:
+                matchLabels:
+                  helmsman.dev/managed: "true"
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/subhankar720/helmsman-app*"
+          skipImageReferences:
+            - "ghcr.io/subhankar720/helmsman-app:*@sha256:*"
+          attestors:
+            - entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEeEQgpLf1sQk7Pm9pAWhsJrNFUn3G
+                      VjRdGeAlqOtBibJXZfYHVkJYbqu8kt4xKivzw93kD9pwDyspv+AvrWujwA==
+                      -----END PUBLIC KEY-----
