@@ -1,0 +1,28 @@
+apiVersion: platform.helmsman.dev/v1alpha1
+kind: AppDeployment
+metadata:
+  name: sample-app
+  namespace: sample-app
+spec:
+  appName: sample-app
+  owningTeam: platform-team
+  costCenterId: "000001"
+  image:
+    repository: ghcr.io/subhankar720/helmsman-app
+    tag: latest
+    pullPolicy: IfNotPresent
+  container:
+    port: 8080
+    command: ["/app/server"]
+    env:
+      APP_ENV: dev
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  replicas: 1
+  oidc:
+    enabled: true
