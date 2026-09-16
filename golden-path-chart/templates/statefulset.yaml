@@ -19,6 +19,7 @@ spec:
       annotations:
         helmsman.dev/cost-center: {{ .Values.costCenterId | quote }}
         helmsman.dev/owning-team: {{ .Values.owningTeam }}
+        checksum/fluent-bit-config: {{ include (print $.Template.BasePath "/configmap-fluentbit.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ .Values.appName }}
       securityContext:
