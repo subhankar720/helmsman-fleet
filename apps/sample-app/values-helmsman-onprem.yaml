@@ -28,3 +28,7 @@ replicas: 1
 
 service:
   type: ClusterIP
+
+# Observability — Loki endpoint reachable from spoke pods via Hub bridge IP
+loki:
+  url: "http://172.18.0.2:30031"

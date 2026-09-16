@@ -21,10 +21,24 @@ data:
         Refresh_Interval  5
         Skip_Empty_Lines  On
 
+    {{- if and .Values.loki .Values.loki.url }}
+    # Ship to Loki when endpoint is configured
+    [OUTPUT]
+        Name              loki
+        Match             *
+        Host              {{ .Values.loki.url | trimPrefix "http://" | splitList ":" | first }}
+        Port              {{ .Values.loki.url | splitList ":" | last }}
+        Labels            job=fluent-bit,app={{ .Values.appName }},namespace={{ .Release.Namespace }}
+        Label_Keys        $method,$path,$status
+        Auto_Kubernetes_Labels off
+        line_format       json
+    {{- else }}
+    # Fall back to stdout when Loki is not configured
     [OUTPUT]
         Name              stdout
         Match             *
         Format            json_lines
+    {{- end }}
 
   parsers.conf: |
     [PARSER]

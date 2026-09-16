@@ -41,3 +41,9 @@ oidc:
 # ── Fluent Bit sidecar ────────────────────────────────────────────────────────
 fluentbit:
   image: "fluent/fluent-bit:3.2"
+
+# ── Loki (observability) ──────────────────────────────────────────────────────
+# When set, Fluent Bit ships logs to this Loki endpoint.
+# Leave empty to fall back to stdout.
+loki:
+  url: ""
