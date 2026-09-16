@@ -60,5 +60,11 @@ spec:
     - ports:
         - port: 8080
           protocol: TCP
+    {{- if and .Values.loki .Values.loki.url }}
+    # Allow egress to Loki for Fluent Bit log shipping
+    - ports:
+        - port: {{ .Values.loki.url | splitList ":" | last }}
+          protocol: TCP
+    {{- end }}
   policyTypes:
     - Egress
