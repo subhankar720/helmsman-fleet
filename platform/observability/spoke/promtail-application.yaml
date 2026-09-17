@@ -1,0 +1,39 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-spoke-promtail
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://grafana.github.io/helm-charts
+    chart: promtail
+    targetRevision: "6.16.6"
+    helm:
+      values: |
+        config:
+          clients:
+            - url: http://172.18.0.2:30031/loki/api/v1/push
+          snippets:
+            pipelineStages:
+              - docker: {}
+        # DaemonSet runs in node network namespace — can reach Hub node IPs
+        # This is the key difference from sidecars which are in pod network
+        tolerations:
+          - operator: Exists
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+  destination:
+    server: https://172.18.0.5:6443
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
