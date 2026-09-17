@@ -17,8 +17,11 @@ spec:
           snippets:
             pipelineStages:
               - docker: {}
-        # DaemonSet runs in node network namespace — can reach Hub node IPs
-        # This is the key difference from sidecars which are in pod network
+        # hostNetwork puts Promtail in the node network namespace
+        # — the only namespace from which Hub Docker bridge IPs are reachable
+        # without a cross-cluster routing setup
+        hostNetwork: true
+        dnsPolicy: ClusterFirstWithHostNet
         tolerations:
           - operator: Exists
         resources:
