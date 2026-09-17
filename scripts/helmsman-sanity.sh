@@ -1,23 +1,25 @@
 #!/bin/bash
 # =============================================================================
-# helmsman-sanity.sh — v8
-# Helmsman Local Dev Environment — Sanity Check and Auto-Fix Script
+# helmsman-sanity.sh — v9
+# Helmsman Local Dev Environment — Read-Only Sanity / Status Report
 # =============================================================================
+#
+# PURPOSE
+# -------
+# This script ONLY inspects and reports. It never restarts containers,
+# patches secrets, syncs Argo CD apps, or deletes pods. If something is
+# broken, this script tells you what and why — then you run
+# ./dev-up-gemini.sh (recovery mode, or --reset if needed) from
+# helmsman-operator/ to actually fix it.
 #
 # WHEN TO RUN THIS SCRIPT
 # -----------------------
-# Run at the START OF EVERY DEV SESSION, or after any Docker Desktop restart.
-# Safe to run multiple times — all operations are idempotent.
+# Run at the START OF EVERY DEV SESSION, or after any Docker Desktop restart,
+# to see what state the environment is in before deciding whether to run
+# dev-up-gemini.sh.
 #
-# ERRORS THAT MEAN YOU NEED THIS SCRIPT
-# --------------------------------------
-# 1. argocd CLI → "connection refused" or hangs
-# 2. argocd app get → "ComparisonError ... connection refused"
-# 3. argocd app get → "InvalidSpecError" (stale cluster IP in Application)
-# 4. argocd CLI → "token has invalid claims: token is expired"
-# 5. ClusterIP services timeout inside pods
-#
-# WHAT BREAKS WHEN DOCKER DESKTOP RESTARTS (in order)
+# WHAT BREAKS WHEN DOCKER DESKTOP RESTARTS (in order) — this script detects
+# each of these, dev-up-gemini.sh fixes them
 # ----------------------------------------------------
 # 1. kube-proxy   → iptables rules wiped → ClusterIP TCP + NodePort broken
 # 2. CoreDNS      → UDP conntrack stale  → DNS resolution times out
@@ -26,18 +28,23 @@
 # 5. argocd-applicationset-controller → can't resolve DNS
 # 6. Spoke cluster IP → Docker bridge reassigns IPs → cluster Secret stale
 # 7. Applications → destination.server has old IP → InvalidSpecError
+# 8. platform-spoke-promtail → applied directly (no app-of-apps), so its
+#    hardcoded clients.url/destination.server go stale on IP drift too
 #
-# RECOVERY ORDER (networking before Argo CD before Applications)
-# -------------------------------------------------------------
+# REPORT ORDER
+# ------------
 # A: Docker check
-# B: Kind container check (detect restart)
-# C: kubectl connectivity
-# D: kube-proxy + CoreDNS recovery (if restart detected)
-# E: Argo CD component recovery (after networking stable)
-# F: Spoke IP drift fix + Application patch
-# G: Login with retry loop
-# H: Status checks via kubectl (no argocd CLI dependency)
-# I: Pod status
+# B: Kind container status
+# C: Hub node IP consistency
+# D: Network health (kube-proxy + CoreDNS + connectivity)
+# E: Argo CD component health
+# F: Spoke IP drift check
+# F.1: Hub HTTP endpoint secret / OIDC / Vault reachability for spoke apps
+# F.2: Promtail (Spoke) Loki IP drift check
+# D.1: Spoke cluster internal connectivity
+# G: Argo CD CLI login (read-only diagnostic session)
+# H: Argo CD cluster and app status
+# I: Spoke workload status
 # =============================================================================
 
 set -uo pipefail
@@ -45,11 +52,24 @@ set -uo pipefail
 # ── Configuration ─────────────────────────────────────────────────────────────
 ARGOCD_URL="localhost:9090"
 ARGOCD_USER="admin"
-ARGOCD_PASS="${ARGOCD_PASS:-nyKTpDW-m4jQnODE}"
+
+# Password resolution order: explicit env var > durable password file written
+# by dev-up-gemini.sh > argocd-initial-admin-secret (only exists right after a
+# fresh --reset, before dev-up-gemini.sh deletes it).
+ARGOCD_PASS_FILE="${ARGOCD_PASS_FILE:-$HOME/.helmsman-dev/argocd-admin-password}"
+ARGOCD_PASS="${ARGOCD_PASS:-}"
+if [ -z "$ARGOCD_PASS" ] && [ -f "$ARGOCD_PASS_FILE" ]; then
+    ARGOCD_PASS=$(cat "$ARGOCD_PASS_FILE" 2>/dev/null || echo "")
+fi
+if [ -z "$ARGOCD_PASS" ]; then
+    ARGOCD_PASS=$(kubectl get secret argocd-initial-admin-secret -n argocd -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+fi
+
 HUB_CONTEXT="kind-helmsman-hub"
 SPOKE_CONTEXT="kind-helmsman-onprem"
 SPOKE_CONTAINER="helmsman-onprem-control-plane"
 HUB_CONTAINER="helmsman-hub-control-plane"
+HUB_WORKER_CONTAINER="helmsman-hub-worker"
 CLUSTER_SECRET_NAME="cluster-helmsman-onprem"
 CLUSTER_REGISTERED_NAME="helmsman-onprem"
 ARGOCD_NAMESPACE="argocd"
@@ -62,15 +82,17 @@ SAMPLE_APP_SERVICE_NAME="sample-app"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-PASS=0; FAIL=0; FIXED=0
+PASS=0; FAIL=0; WARN=0
 ok()    { echo -e "  ${GREEN}✔${NC}  $1"; ((PASS++)); }
 fail()  { echo -e "  ${RED}✘${NC}  $1"; ((FAIL++)); }
-fix()   { echo -e "  ${YELLOW}⚙${NC}  $1"; ((FIXED++)); }
+warn()  { echo -e "  ${YELLOW}⚠${NC}  $1"; ((WARN++)); }
 info()  { echo -e "  ${CYAN}ℹ${NC}  $1"; }
 header(){ echo -e "\n${BOLD}${BLUE}── $1 ──${NC}"; }
 
-echo -e "\n${BOLD}Helmsman Sanity Check${NC} — $(date '+%Y-%m-%d %H:%M:%S')"
+echo -e "\n${BOLD}Helmsman Sanity Report${NC} — $(date '+%Y-%m-%d %H:%M:%S')"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+RECOVER_HINT="  ${YELLOW}→ Fix with:${NC} cd ~/projects/helmsman/helmsman-operator && ./dev-up-gemini.sh"
 
 # =============================================================================
 header "A. Docker"
@@ -86,9 +108,8 @@ ok "Docker accessible — ${DOCKER_OS}"
 # =============================================================================
 header "B. Kind Cluster Containers"
 # =============================================================================
-CONTAINERS_RESTARTED=false
-NETWORK_BROKEN=false
-BAD_NODES=""
+RECENT_RESTART_DETECTED=false
+CONTAINERS_DOWN=false
 
 for CONTAINER in "$HUB_CONTAINER" "$SPOKE_CONTAINER"; do
     STATUS=$(docker inspect "$CONTAINER" --format='{{.State.Status}}' 2>/dev/null || echo "not_found")
@@ -99,31 +120,32 @@ for CONTAINER in "$HUB_CONTAINER" "$SPOKE_CONTAINER"; do
             NOW_EPOCH=$(date +%s)
             AGE_SECS=$(( NOW_EPOCH - STARTED_EPOCH ))
             if [ "$AGE_SECS" -lt 600 ] 2>/dev/null; then
-                fix "Container $CONTAINER started recently (${AGE_SECS}s ago) — network recovery needed"
-                CONTAINERS_RESTARTED=true
+                warn "Container $CONTAINER started recently (${AGE_SECS}s ago) — Docker/Kind likely restarted, network state may be stale"
+                RECENT_RESTART_DETECTED=true
             else
                 ok "Container $CONTAINER running (up ${AGE_SECS}s)"
             fi
             ;;
         exited|stopped|created)
-            fix "Container $CONTAINER stopped — starting..."
-            docker start "$CONTAINER" > /dev/null 2>&1 || true
-            sleep 8
-            NEW_STATUS=$(docker inspect "$CONTAINER" --format='{{.State.Status}}' 2>/dev/null || echo "unknown")
-            if [ "$NEW_STATUS" = "running" ]; then
-                ok "Container $CONTAINER started"
-                CONTAINERS_RESTARTED=true
-            else
-                fail "Container $CONTAINER failed to start (status: $NEW_STATUS)"
-            fi
+            fail "Container $CONTAINER is $STATUS (not running)"
+            CONTAINERS_DOWN=true
             ;;
         not_found)
             fail "Container $CONTAINER not found"
-            echo -e "  ${YELLOW}FIX:${NC} cd ~/projects/helmsman/clusters && kind create cluster --config hub-cluster.yaml"
+            echo -e "  ${YELLOW}FIX:${NC} cd ~/projects/helmsman/helmsman-operator && ./dev-up-gemini.sh --reset"
+            CONTAINERS_DOWN=true
             ;;
         *) fail "Container $CONTAINER: unexpected state '$STATUS'" ;;
     esac
 done
+
+if [ "$CONTAINERS_DOWN" = true ]; then
+    echo ""
+    echo -e "$RECOVER_HINT"
+    echo ""
+    echo -e "  ${RED}${BOLD}Cannot continue — Kind containers are not all running.${NC}"
+    exit 1
+fi
 
 # =============================================================================
 header "C. Hub Node IP Consistency (kubelet registration check)"
@@ -132,11 +154,10 @@ header "C. Hub Node IP Consistency (kubelet registration check)"
 # cannot reach the kubelet. This happens when node InternalIPs in etcd don't
 # match the actual Docker bridge IPs (common after multiple Docker restarts).
 
-NODE_RESTART_NEEDED=false
+NODE_IP_DRIFT=false
 while IFS= read -r node_line; do
     NODE_NAME=$(echo "$node_line" | awk '{print $1}')
     NODE_IP=$(echo "$node_line"   | awk '{print $6}')
-    # Map node name to container name (kind naming convention)
     CONTAINER_NAME="helmsman-hub-${NODE_NAME##helmsman-hub-}"
     CONTAINER_IP=$(docker inspect "$CONTAINER_NAME" \
         --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
@@ -144,22 +165,13 @@ while IFS= read -r node_line; do
         continue
     fi
     if [ "$NODE_IP" != "$CONTAINER_IP" ]; then
-        fix "Node $NODE_NAME IP mismatch: etcd=$NODE_IP actual=$CONTAINER_IP — kubelet needs re-registration"
-        NODE_RESTART_NEEDED=true
-        CONTAINERS_RESTARTED=true
+        warn "Node $NODE_NAME IP mismatch: etcd=$NODE_IP actual=$CONTAINER_IP — kubelet needs re-registration (restart worker containers)"
+        NODE_IP_DRIFT=true
     else
         ok "Node $NODE_NAME IP consistent: $NODE_IP"
     fi
 done < <(kubectl get nodes -o wide --context "$HUB_CONTEXT" \
     --no-headers 2>/dev/null | grep -v "control-plane")
-
-if [ "$NODE_RESTART_NEEDED" = true ]; then
-    fix "Restarting worker node containers to force kubelet re-registration"
-    docker restart helmsman-hub-worker helmsman-hub-worker2 > /dev/null 2>&1 || true
-    info "Waiting 30s for kubelets to re-register with correct IPs..."
-    sleep 30
-    ok "Worker nodes restarted — kubectl exec and port-forward should now work"
-fi
 
 if kubectl get nodes --context "$HUB_CONTEXT" > /dev/null 2>&1; then
     N=$(kubectl get nodes --context "$HUB_CONTEXT" --no-headers 2>/dev/null | wc -l | tr -d ' ')
@@ -185,173 +197,96 @@ if [ -z "$SPOKE_IP" ]; then
 fi
 info "Current spoke Docker bridge IP: $SPOKE_IP"
 
+# Consistent Hub IP definition used everywhere below — matches what
+# dev-up-gemini.sh actually configures (worker IP, falling back to
+# control-plane), so this report checks against the same value the fixer uses.
+HUB_IP=$(docker inspect "$HUB_WORKER_CONTAINER" \
+    --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
+if [ -z "$HUB_IP" ]; then
+    HUB_IP=$(docker inspect "$HUB_CONTAINER" \
+        --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
+fi
+info "Current hub IP (worker, fallback control-plane): ${HUB_IP:-unknown}"
+
 # =============================================================================
-header "D. Network Recovery (kube-proxy + CoreDNS)"
+header "D. Network Health (kube-proxy + CoreDNS)"
 # =============================================================================
-# DNS check via pod readiness — no kubectl run, no image pull, no timeout race
 COREDNS_READY=$(kubectl get pods -n kube-system --context "$HUB_CONTEXT" \
     -l k8s-app=kube-dns --no-headers 2>/dev/null | grep -c "Running" || echo "0")
 COREDNS_READY=$(echo "$COREDNS_READY" | tr -d '[:space:]')
 
-NEED_RECOVERY=false
-if [ "$CONTAINERS_RESTARTED" = true ]; then
-    NEED_RECOVERY=true
-    info "Containers recently restarted — running full network recovery"
+NETWORK_SUSPECT=false
+if [ "$RECENT_RESTART_DETECTED" = true ]; then
+    NETWORK_SUSPECT=true
+    info "Containers recently restarted — network state may be stale, running full connectivity checks"
 elif [ "${COREDNS_READY:-0}" -lt 1 ] 2>/dev/null; then
-    NEED_RECOVERY=true
-    info "CoreDNS pods not Running — triggering network recovery"
+    NETWORK_SUSPECT=true
+    warn "CoreDNS pods not Running"
+else
+    ok "CoreDNS pods Running"
 fi
 
-if [ "$NEED_RECOVERY" = true ]; then
-    fix "Restarting kube-proxy — regenerates iptables ClusterIP and NodePort rules"
-    kubectl rollout restart daemonset/kube-proxy \
-        -n kube-system --context "$HUB_CONTEXT" > /dev/null 2>&1
-    kubectl rollout status daemonset/kube-proxy \
-        -n kube-system --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1
-    info "Waiting 15s for iptables rules to fully propagate..."
-    sleep 15
-    ok "kube-proxy restarted"
+for POD_LABEL in "app.kubernetes.io/name=argocd-application-controller" "app.kubernetes.io/name=argocd-server"; do
+    SERVICE_TEST_POD=$(kubectl get pod -n argocd --context "$HUB_CONTEXT" \
+        -l $POD_LABEL -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+    if [ -z "$SERVICE_TEST_POD" ]; then
+        info "No pod found for $POD_LABEL"
+        continue
+    fi
 
-    fix "Restarting CoreDNS — clears stale UDP conntrack entries"
-    kubectl rollout restart deployment/coredns \
-        -n kube-system --context "$HUB_CONTEXT" > /dev/null 2>&1
-    kubectl rollout status deployment/coredns \
-        -n kube-system --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1
-    info "Waiting 15s for CoreDNS to stabilise..."
-    sleep 15
-    ok "CoreDNS restarted"
-
-    COREDNS_CHECK=$(kubectl get pods -n kube-system --context "$HUB_CONTEXT" \
-        -l k8s-app=kube-dns --no-headers 2>/dev/null | grep -c "Running" || echo "0")
-    COREDNS_CHECK=$(echo "$COREDNS_CHECK" | tr -d '[:space:]')
-    if [ "${COREDNS_CHECK:-0}" -ge 1 ] 2>/dev/null; then
-        ok "CoreDNS pods Running"
-
-        for POD_LABEL in "app.kubernetes.io/name=argocd-application-controller" "app.kubernetes.io/name=argocd-server"; do
-            SERVICE_TEST_POD=$(kubectl get pod -n argocd --context "$HUB_CONTEXT" \
-                -l $POD_LABEL -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
-            if [ -z "$SERVICE_TEST_POD" ]; then
-                info "No pod found for $POD_LABEL"
-                continue
-            fi
-
-            if kubectl exec -n argocd --context "$HUB_CONTEXT" "$SERVICE_TEST_POD" -- \
-                bash -lc 'exec 3<>/dev/tcp/argocd-repo-server/8081 >/dev/null 2>&1' \
-                > /dev/null 2>&1; then
-                ok "argocd-repo-server reachable from $SERVICE_TEST_POD"
-            else
-                fail "Cannot reach argocd-repo-server:8081 from $SERVICE_TEST_POD — possible kube-proxy/ClusterIP issue"
-                NETWORK_BROKEN=true
-            fi
-
-            if kubectl exec -n argocd --context "$HUB_CONTEXT" "$SERVICE_TEST_POD" -- \
-                bash -lc 'exec 3<>/dev/tcp/10.96.0.1/443 >/dev/null 2>&1' \
-                > /dev/null 2>&1; then
-                ok "Kubernetes API service reachable from $SERVICE_TEST_POD"
-            else
-                fail "Kubernetes API service 10.96.0.1:443 unreachable from $SERVICE_TEST_POD"
-                NETWORK_BROKEN=true
-            fi
-
-            if [ -n "$SPOKE_IP" ]; then
-                if kubectl exec -n argocd --context "$HUB_CONTEXT" "$SERVICE_TEST_POD" -- \
-                    bash -lc "exec 3<>/dev/tcp/${SPOKE_IP}/6443 >/dev/null 2>&1" \
-                    > /dev/null 2>&1; then
-                    ok "Spoke cluster $SPOKE_IP:6443 reachable from $SERVICE_TEST_POD"
-                else
-                    NODE_NAME=$(kubectl get pod -n argocd --context "$HUB_CONTEXT" "$SERVICE_TEST_POD" -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "")
-                    fail "Spoke cluster $SPOKE_IP:6443 unreachable from $SERVICE_TEST_POD on node $NODE_NAME"
-                    NETWORK_BROKEN=true
-                    BAD_NODES="$BAD_NODES $NODE_NAME"
-                fi
-            fi
-        done
-
-        if [ "$NETWORK_BROKEN" = true ] && [ -n "$BAD_NODES" ]; then
-            for NODE_NAME in $BAD_NODES; do
-                CONTAINER_NAME="helmsman-hub-${NODE_NAME##helmsman-hub-}"
-                fix "Restarting node container $CONTAINER_NAME because pod on $NODE_NAME cannot reach spoke cluster"
-                docker restart "$CONTAINER_NAME" > /dev/null 2>&1 || true
-            done
-            info "Waiting 30s for restarted nodes to rejoin network"
-            sleep 30
-            kubectl rollout restart daemonset/kube-proxy \
-                -n kube-system --context "$HUB_CONTEXT" > /dev/null 2>&1
-            kubectl rollout status daemonset/kube-proxy \
-                -n kube-system --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1
-            info "Waiting 15s for kube-proxy to stabilise after node restart"
-            sleep 15
-        fi
+    if kubectl exec -n argocd --context "$HUB_CONTEXT" "$SERVICE_TEST_POD" -- \
+        bash -lc 'exec 3<>/dev/tcp/argocd-repo-server/8081 >/dev/null 2>&1' \
+        > /dev/null 2>&1; then
+        ok "argocd-repo-server reachable from $SERVICE_TEST_POD"
     else
-        fail "CoreDNS pods still not Running — check: kubectl get pods -n kube-system -l k8s-app=kube-dns"
-        NETWORK_BROKEN=true
+        fail "Cannot reach argocd-repo-server:8081 from $SERVICE_TEST_POD — kube-proxy/ClusterIP likely broken"
     fi
 
-    if [ "$NETWORK_BROKEN" = true ] && [ -n "$BAD_NODES" ]; then
-        NEED_RECOVERY=true
+    if kubectl exec -n argocd --context "$HUB_CONTEXT" "$SERVICE_TEST_POD" -- \
+        bash -lc 'exec 3<>/dev/tcp/10.96.0.1/443 >/dev/null 2>&1' \
+        > /dev/null 2>&1; then
+        ok "Kubernetes API service reachable from $SERVICE_TEST_POD"
+    else
+        fail "Kubernetes API service 10.96.0.1:443 unreachable from $SERVICE_TEST_POD"
     fi
+
+    if [ -n "$SPOKE_IP" ]; then
+        if kubectl exec -n argocd --context "$HUB_CONTEXT" "$SERVICE_TEST_POD" -- \
+            bash -lc "exec 3<>/dev/tcp/${SPOKE_IP}/6443 >/dev/null 2>&1" \
+            > /dev/null 2>&1; then
+            ok "Spoke cluster $SPOKE_IP:6443 reachable from $SERVICE_TEST_POD"
+        else
+            NODE_NAME=$(kubectl get pod -n argocd --context "$HUB_CONTEXT" "$SERVICE_TEST_POD" -o jsonpath='{.spec.nodeName}' 2>/dev/null || echo "")
+            fail "Spoke cluster $SPOKE_IP:6443 unreachable from $SERVICE_TEST_POD on node $NODE_NAME"
+        fi
+    fi
+done
+
+# =============================================================================
+header "E. Argo CD Component Health"
+# =============================================================================
+for NAME in argocd-redis argocd-repo-server argocd-server argocd-applicationset-controller; do
+    READY=$(kubectl get pods -n argocd --context "$HUB_CONTEXT" \
+        -l "app.kubernetes.io/name=$NAME" --no-headers 2>/dev/null | grep -c "Running" || echo "0")
+    READY=$(echo "$READY" | tr -d '[:space:]')
+    if [ "${READY:-0}" -ge 1 ] 2>/dev/null; then
+        ok "$NAME Running"
+    else
+        fail "$NAME not Running"
+    fi
+done
+READY=$(kubectl get pods -n argocd --context "$HUB_CONTEXT" \
+    -l "app.kubernetes.io/name=argocd-application-controller" --no-headers 2>/dev/null | grep -c "Running" || echo "0")
+READY=$(echo "$READY" | tr -d '[:space:]')
+if [ "${READY:-0}" -ge 1 ] 2>/dev/null; then
+    ok "argocd-application-controller Running"
 else
-    ok "Network healthy — recovery not needed"
+    fail "argocd-application-controller not Running"
 fi
 
 # =============================================================================
-header "E. Argo CD Component Recovery"
+header "F. Spoke IP Drift Check"
 # =============================================================================
-if [ "$NEED_RECOVERY" = true ]; then
-    fix "Restarting argocd-redis"
-    kubectl rollout restart deployment/argocd-redis \
-        -n argocd --context "$HUB_CONTEXT" > /dev/null 2>&1
-    kubectl rollout status deployment/argocd-redis \
-        -n argocd --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1
-    ok "argocd-redis restarted"
-
-    fix "Restarting argocd-repo-server"
-    kubectl rollout restart deployment/argocd-repo-server \
-        -n argocd --context "$HUB_CONTEXT" > /dev/null 2>&1
-    kubectl rollout status deployment/argocd-repo-server \
-        -n argocd --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1
-    ok "argocd-repo-server restarted"
-
-    fix "Restarting argocd-server"
-    kubectl rollout restart deployment/argocd-server \
-        -n argocd --context "$HUB_CONTEXT" > /dev/null 2>&1
-    kubectl rollout status deployment/argocd-server \
-        -n argocd --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1
-    ok "argocd-server restarted"
-
-    fix "Restarting argocd-application-controller"
-    kubectl rollout restart deployment/argocd-application-controller \
-        -n argocd --context "$HUB_CONTEXT" > /dev/null 2>&1
-    kubectl rollout status deployment/argocd-application-controller \
-        -n argocd --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1
-    ok "argocd-application-controller restarted"
-
-    fix "Restarting argocd-applicationset-controller"
-    kubectl rollout restart deployment/argocd-applicationset-controller \
-        -n argocd --context "$HUB_CONTEXT" > /dev/null 2>&1
-    kubectl rollout status deployment/argocd-applicationset-controller \
-        -n argocd --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1
-    ok "argocd-applicationset-controller restarted"
-
-    info "Waiting 20s for Argo CD to fully initialise..."
-    sleep 20
-else
-    ok "Argo CD recovery not needed"
-fi
-
-# =============================================================================
-header "F. Spoke IP Drift Check and Fix"
-# =============================================================================
-SPOKE_IP=$(docker inspect "$SPOKE_CONTAINER" \
-    --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
-
-if [ -z "$SPOKE_IP" ]; then
-    fail "Cannot determine spoke Docker bridge IP"
-    exit 1
-fi
-
-info "Current spoke Docker bridge IP: $SPOKE_IP"
-
 STORED_SERVER=$(kubectl get secret "$CLUSTER_SECRET_NAME" \
     -n "$ARGOCD_NAMESPACE" --context "$HUB_CONTEXT" \
     -o jsonpath='{.data.server}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
@@ -359,152 +294,78 @@ STORED_SERVER=$(kubectl get secret "$CLUSTER_SECRET_NAME" \
 EXPECTED_SERVER="https://${SPOKE_IP}:6443"
 
 if [ "$STORED_SERVER" = "$EXPECTED_SERVER" ]; then
-    ok "Cluster Secret IP current ($SPOKE_IP) — no update needed"
+    ok "Cluster Secret IP current ($SPOKE_IP)"
 else
-    OLD_IP=$(echo "$STORED_SERVER" | sed 's|https://||' | cut -d: -f1)
-    fix "IP drift: $STORED_SERVER → $EXPECTED_SERVER"
-
-    SPOKE_TOKEN=$(kubectl --context "$SPOKE_CONTEXT" \
-        get secret argocd-manager-token -n kube-system \
-        -o jsonpath='{.data.token}' 2>/dev/null | base64 -d)
-
-    if [ -z "$SPOKE_TOKEN" ]; then
-        fail "Cannot extract argocd-manager-token from spoke"
-    else
-        kubectl delete secret "$CLUSTER_SECRET_NAME" \
-            -n "$ARGOCD_NAMESPACE" --context "$HUB_CONTEXT" > /dev/null 2>&1 || true
-
-        kubectl apply --context "$HUB_CONTEXT" -f - > /dev/null <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: ${CLUSTER_SECRET_NAME}
-  namespace: ${ARGOCD_NAMESPACE}
-  labels:
-    argocd.argoproj.io/secret-type: cluster
-    platform-enabled: "true"
-type: Opaque
-stringData:
-  name: ${CLUSTER_REGISTERED_NAME}
-  server: https://${SPOKE_IP}:6443
-  config: |
-    {"bearerToken":"${SPOKE_TOKEN}","tlsClientConfig":{"insecure":true}}
-EOF
-        ok "Cluster Secret updated → https://${SPOKE_IP}:6443"
-
-        # Patch stale Applications in-place (never delete — avoids finalizer hang)
-        STALE_APPS=$(kubectl get applications -n argocd \
-            --context "$HUB_CONTEXT" \
-            -o jsonpath="{range .items[?(@.spec.destination.server=='https://${OLD_IP}:6443')]}{.metadata.name}{'\n'}{end}" \
-            2>/dev/null || echo "")
-
-        PATCHED_APPS=""
-        if [ -n "$STALE_APPS" ]; then
-            for APP in $STALE_APPS; do
-                fix "Patching Application $APP: $OLD_IP → $SPOKE_IP"
-                if kubectl patch application "$APP" \
-                    -n argocd --context "$HUB_CONTEXT" \
-                    --type=merge \
-                    -p "{\"spec\":{\"destination\":{\"server\":\"https://${SPOKE_IP}:6443\"}}}" \
-                    > /dev/null 2>&1; then
-                    ok "Patched: $APP"
-                    PATCHED_APPS="$PATCHED_APPS $APP"
-                else
-                    fail "Failed to patch: $APP"
-                fi
-            done
-        else
-            info "No stale Applications to patch"
-        fi
-
-        # Trigger refresh for patched apps and ApplicationSet reconcile
-        for APP in $PATCHED_APPS; do
-            kubectl annotate application "$APP" \
-                -n argocd --context "$HUB_CONTEXT" \
-                argocd.argoproj.io/refresh=normal --overwrite > /dev/null 2>&1 || true
-            info "Annotated patched application $APP for refresh"
-        done
-
-        kubectl annotate applicationset helmsman-apps \
-            -n argocd --context "$HUB_CONTEXT" \
-            argocd.argoproj.io/refresh=normal --overwrite > /dev/null 2>&1 || true
-        info "Waiting 15s for ApplicationSet to reconcile..."
-        sleep 15
-    fi
+    warn "Cluster Secret IP drift: $STORED_SERVER → $EXPECTED_SERVER"
 fi
 
-# Ensure spoke apps have a platform config pointing at the current Hub HTTP endpoint
+OLD_IP=$(echo "$STORED_SERVER" | sed 's|https://||' | cut -d: -f1)
+STALE_APPS=$(kubectl get applications -n argocd \
+    --context "$HUB_CONTEXT" \
+    -o jsonpath="{range .items[?(@.spec.destination.server=='https://${OLD_IP}:6443')]}{.metadata.name}{'\n'}{end}" \
+    2>/dev/null || echo "")
+if [ -n "$STALE_APPS" ] && [ "$STORED_SERVER" != "$EXPECTED_SERVER" ]; then
+    for APP in $STALE_APPS; do
+        warn "Application $APP still targets stale destination https://${OLD_IP}:6443"
+    done
+else
+    ok "No Applications targeting a stale spoke IP"
+fi
+
+# =============================================================================
 header "F.1 Hub HTTP endpoint secret for spoke applications"
-HUB_IP=$(docker inspect "$HUB_CONTAINER" --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
+# =============================================================================
 if [ -n "$HUB_IP" ]; then
-    fix "Updating helmsman-platform-config secret in spoke to point at Hub $HUB_IP"
-    if kubectl --context "$SPOKE_CONTEXT" -n sample-app create secret generic helmsman-platform-config \
-        --from-literal=keycloak-url="http://${HUB_IP}:30081" \
-        --from-literal=keycloak-admin-user=admin \
-        --from-literal=keycloak-admin-password=helmsman123 \
-        --from-literal=keycloak-realm=helmsman \
-        --from-literal=vault-url="http://${HUB_IP}:30082" \
-        --from-literal=vault-token=root \
-        --dry-run=client -o yaml | kubectl --context "$SPOKE_CONTEXT" -n sample-app apply --server-side --force-conflicts -f - > /dev/null 2>&1; then
-        ok "helmsman-platform-config applied in spoke (keycloak-url=http://${HUB_IP}:30081, vault-url=http://${HUB_IP}:30082)"
-    else
-        fail "Failed to apply helmsman-platform-config in spoke"
-    fi
-    # Validate that the secret contains the expected values
     EXPECTED_KEYCLOAK_URL="http://${HUB_IP}:30081"
     EXPECTED_VAULT_URL="http://${HUB_IP}:30082"
     EXPECTED_KEYCLOAK_REALM="helmsman"
     EXPECTED_ISSUER_URL="${EXPECTED_KEYCLOAK_URL}/realms/${EXPECTED_KEYCLOAK_REALM}"
-    ACTUAL_KEYCLOAK_URL=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret helmsman-platform-config -o jsonpath='{.data.keycloak-url}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
-    ACTUAL_VAULT_URL=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret helmsman-platform-config -o jsonpath='{.data.vault-url}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
-    if [ "$ACTUAL_KEYCLOAK_URL" = "$EXPECTED_KEYCLOAK_URL" ] && [ "$ACTUAL_VAULT_URL" = "$EXPECTED_VAULT_URL" ]; then
-        ok "helmsman-platform-config validation passed"
+
+    if kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret helmsman-platform-config > /dev/null 2>&1; then
+        ACTUAL_KEYCLOAK_URL=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret helmsman-platform-config -o jsonpath='{.data.keycloak-url}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+        ACTUAL_VAULT_URL=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret helmsman-platform-config -o jsonpath='{.data.vault-url}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+        if [ "$ACTUAL_KEYCLOAK_URL" = "$EXPECTED_KEYCLOAK_URL" ] && [ "$ACTUAL_VAULT_URL" = "$EXPECTED_VAULT_URL" ]; then
+            ok "helmsman-platform-config current (keycloak-url=$ACTUAL_KEYCLOAK_URL, vault-url=$ACTUAL_VAULT_URL)"
+        else
+            warn "helmsman-platform-config stale: got keycloak-url=$ACTUAL_KEYCLOAK_URL vault-url=$ACTUAL_VAULT_URL, expected keycloak-url=$EXPECTED_KEYCLOAK_URL vault-url=$EXPECTED_VAULT_URL"
+        fi
     else
-        fail "helmsman-platform-config validation failed: got keycloak-url=$ACTUAL_KEYCLOAK_URL vault-url=$ACTUAL_VAULT_URL"
+        fail "helmsman-platform-config secret missing in sample-app namespace"
     fi
 
-    # Refresh the runtime OIDC secret the ADC sidecar actually consumes.
     if kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret sample-app-oidc > /dev/null 2>&1; then
         CURRENT_ISSUER_URL=$(kubectl --context "$SPOKE_CONTEXT" -n sample-app get secret sample-app-oidc -o jsonpath='{.data.issuer-url}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
-        if [ "$CURRENT_ISSUER_URL" != "$EXPECTED_ISSUER_URL" ]; then
-            fix "Refreshing sample-app-oidc issuer-url to $EXPECTED_ISSUER_URL"
-            ISSUER_B64=$(printf '%s' "$EXPECTED_ISSUER_URL" | base64 -w0 2>/dev/null || printf '%s' "$EXPECTED_ISSUER_URL" | base64)
-            kubectl --context "$SPOKE_CONTEXT" -n sample-app patch secret sample-app-oidc --type=merge -p "{\"data\":{\"issuer-url\":\"$ISSUER_B64\"}}" > /dev/null 2>&1 || true
-            kubectl --context "$SPOKE_CONTEXT" -n sample-app annotate externalsecret sample-app-oidc force-sync="$(date +%s)" --overwrite > /dev/null 2>&1 || true
-            kubectl --context "$SPOKE_CONTEXT" -n sample-app rollout restart statefulset/sample-app > /dev/null 2>&1 || true
-            kubectl --context "$SPOKE_CONTEXT" -n sample-app rollout status statefulset/sample-app --timeout=180s > /dev/null 2>&1 || true
-            ok "sample-app-oidc issuer-url refreshed and StatefulSet restarted"
+        if [ "$CURRENT_ISSUER_URL" = "$EXPECTED_ISSUER_URL" ]; then
+            ok "sample-app-oidc issuer-url current ($CURRENT_ISSUER_URL)"
         else
-            ok "sample-app-oidc issuer-url already current"
+            warn "sample-app-oidc issuer-url stale: got $CURRENT_ISSUER_URL, expected $EXPECTED_ISSUER_URL"
         fi
+    else
+        fail "sample-app-oidc secret missing in sample-app namespace"
     fi
 
-    NEEDS_SAMPLE_APP_RESYNC=false
     if kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" get externalsecret "$SAMPLE_APP_EXTERNAL_SECRET" > /dev/null 2>&1; then
         ES_READY=$(kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" get externalsecret "$SAMPLE_APP_EXTERNAL_SECRET" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
         if [ "$ES_READY" = "True" ]; then
             ok "ExternalSecret $SAMPLE_APP_EXTERNAL_SECRET is Ready"
         else
             fail "ExternalSecret $SAMPLE_APP_EXTERNAL_SECRET is not Ready"
-            kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" annotate externalsecret "$SAMPLE_APP_EXTERNAL_SECRET" force-sync="$(date +%s)" --overwrite > /dev/null 2>&1 || true
-            NEEDS_SAMPLE_APP_RESYNC=true
         fi
     else
         fail "ExternalSecret $SAMPLE_APP_EXTERNAL_SECRET is missing in $SAMPLE_APP_NAMESPACE namespace"
-        NEEDS_SAMPLE_APP_RESYNC=true
     fi
+
     if kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" get secret "$SAMPLE_APP_EXTERNAL_SECRET" > /dev/null 2>&1; then
         SECRET_KEYS=$(kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" get secret "$SAMPLE_APP_EXTERNAL_SECRET" -o jsonpath='{.data}' 2>/dev/null || echo "")
         if echo "$SECRET_KEYS" | grep -q 'cookie-secret'; then
-            ok "Secret $SAMPLE_APP_EXTERNAL_SECRET exists and contains cookie-secret"
+            ok "Secret $SAMPLE_APP_EXTERNAL_SECRET contains cookie-secret"
         else
             fail "Secret $SAMPLE_APP_EXTERNAL_SECRET exists but cookie-secret is missing"
-            NEEDS_SAMPLE_APP_RESYNC=true
         fi
     else
         fail "Secret $SAMPLE_APP_EXTERNAL_SECRET is missing in $SAMPLE_APP_NAMESPACE namespace"
-        NEEDS_SAMPLE_APP_RESYNC=true
     fi
+
     if kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" get svc "$SAMPLE_APP_SERVICE_NAME" > /dev/null 2>&1; then
         SERVICE_PORT=$(kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" get svc "$SAMPLE_APP_SERVICE_NAME" -o jsonpath='{.spec.ports[0].targetPort}' 2>/dev/null || echo "")
         if [ "$SERVICE_PORT" = "4180" ]; then
@@ -521,50 +382,79 @@ if [ -n "$HUB_IP" ]; then
     else
         fail "Service $SAMPLE_APP_SERVICE_NAME is missing in $SAMPLE_APP_NAMESPACE namespace"
     fi
+
     kubectl --context "$SPOKE_CONTEXT" -n default delete pod vault-keycloak-check --ignore-not-found > /dev/null 2>&1 || true
     if kubectl --context "$SPOKE_CONTEXT" -n default run --quiet --rm -i --restart=Never vault-keycloak-check --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' http://${HUB_IP}:30081" 2>/dev/null | grep -Eq '^[23][0-9][0-9]$'; then
         ok "Keycloak HTTP endpoint reachable from spoke at http://${HUB_IP}:30081"
     else
         fail "Keycloak http://${HUB_IP}:30081 not reachable from spoke"
     fi
-    # --- Ensure ExternalSecrets ClusterSecretStore can reach Vault via NodePort ---
-    HUB_WORKER_IPS=(
-        $(docker inspect helmsman-hub-worker --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
-        $(docker inspect helmsman-hub-worker2 --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
-        $(docker inspect helmsman-hub-control-plane --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
-    )
-    TARGET_IP=""
+
+    # --- Check that the ClusterSecretStore's Vault server is actually reachable ---
+    CSS_SERVER=$(kubectl --context "$SPOKE_CONTEXT" get clustersecretstore vault-backend -o jsonpath='{.spec.provider.vault.server}' 2>/dev/null || echo "")
+    EXPECTED_VAULT_NODEPORT_URL="http://${HUB_IP}:30082"
     kubectl --context "$SPOKE_CONTEXT" -n sample-app delete pod vault-check --ignore-not-found > /dev/null 2>&1 || true
-    for IP_CANDIDATE in "${HUB_WORKER_IPS[@]}"; do
-        if [ -z "$IP_CANDIDATE" ]; then
-            continue
-        fi
-        if kubectl --context "$SPOKE_CONTEXT" -n sample-app run --quiet --rm -i --restart=Never vault-check --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 http://${IP_CANDIDATE}:30082/v1/sys/health" > /dev/null 2>&1; then
-            TARGET_IP="$IP_CANDIDATE"
-            ok "Vault NodePort reachable from spoke at ${TARGET_IP}:30082"
-            break
-        fi
-    done
-    if [ -z "$TARGET_IP" ]; then
-        fail "No reachable Hub node IP found for Vault NodePort; cannot update ClusterSecretStore"
+    if [ -z "$CSS_SERVER" ]; then
+        fail "ClusterSecretStore 'vault-backend' not found in spoke cluster"
     else
-        fix "Patching ClusterSecretStore 'vault-backend' in spoke to use http://${TARGET_IP}:30082"
-        kubectl --context "$SPOKE_CONTEXT" patch clustersecretstore vault-backend --type=merge -p "{\"spec\":{\"provider\":{\"vault\":{\"server\":\"http://${TARGET_IP}:30082\"}}}}" > /dev/null 2>&1 || true
-        info "Waiting for ClusterSecretStore 'vault-backend' to become Ready (timeout 30s)"
-        for i in {1..6}; do
-            READY=$(kubectl --context "$SPOKE_CONTEXT" get clustersecretstore vault-backend -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
-            if [ "$READY" = "True" ]; then
-                ok "ClusterSecretStore 'vault-backend' is Ready"
-                break
-            fi
-            sleep 5
-        done
-        if [ "$READY" != "True" ]; then
-            fail "ClusterSecretStore 'vault-backend' validation still failing; check ExternalSecrets controller logs"
+        if kubectl --context "$SPOKE_CONTEXT" -n sample-app run --quiet --rm -i --restart=Never vault-check --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 ${CSS_SERVER}/v1/sys/health" > /dev/null 2>&1; then
+            ok "ClusterSecretStore vault-backend server ($CSS_SERVER) reachable from spoke"
+        else
+            fail "ClusterSecretStore vault-backend server ($CSS_SERVER) NOT reachable from spoke (expected $EXPECTED_VAULT_NODEPORT_URL)"
+        fi
+        READY=$(kubectl --context "$SPOKE_CONTEXT" get clustersecretstore vault-backend -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "False")
+        if [ "$READY" = "True" ]; then
+            ok "ClusterSecretStore 'vault-backend' is Ready"
+        else
+            fail "ClusterSecretStore 'vault-backend' is not Ready"
+        fi
+        if [ "$CSS_SERVER" != "$EXPECTED_VAULT_NODEPORT_URL" ]; then
+            warn "ClusterSecretStore vault-backend server ($CSS_SERVER) differs from the Hub IP this report uses ($EXPECTED_VAULT_NODEPORT_URL) — may still be valid if that IP is reachable"
         fi
     fi
 else
-    info "Could not determine Hub container IP; skipping helmsman-platform-config update"
+    fail "Could not determine Hub container IP; skipping helmsman-platform-config checks"
+fi
+
+# =============================================================================
+header "F.2 Promtail (Spoke) Loki IP Drift Check"
+# =============================================================================
+# platform-spoke-promtail is applied directly with `kubectl apply` (not via an
+# app-of-apps), so unlike Applications synced from git, a stale clients.url or
+# destination.server here will NOT self-heal from a `git push` alone — it
+# needs dev-up-gemini.sh's Stage 7.5 (or a manual re-apply) to pick up a new
+# HUB_IP/SPOKE_IP.
+if [ -n "$HUB_IP" ]; then
+    PROMTAIL_VALUES=$(kubectl --context "$HUB_CONTEXT" -n argocd get application platform-spoke-promtail \
+        -o jsonpath='{.spec.source.helm.values}' 2>/dev/null || echo "")
+    EXPECTED_LOKI_CLIENT_URL="http://${HUB_IP}:30031/loki/api/v1/push"
+    if [ -z "$PROMTAIL_VALUES" ]; then
+        fail "Application platform-spoke-promtail not found (or has no helm values) in argocd namespace"
+    elif echo "$PROMTAIL_VALUES" | grep -qF "$EXPECTED_LOKI_CLIENT_URL"; then
+        ok "platform-spoke-promtail clients.url current ($EXPECTED_LOKI_CLIENT_URL)"
+    else
+        ACTUAL_LOKI_CLIENT_URL=$(echo "$PROMTAIL_VALUES" | grep -o 'http://[^ ]*/loki/api/v1/push' | head -1)
+        warn "platform-spoke-promtail clients.url stale: got ${ACTUAL_LOKI_CLIENT_URL:-<none found>}, expected $EXPECTED_LOKI_CLIENT_URL"
+    fi
+
+    PROMTAIL_DEST_SERVER=$(kubectl --context "$HUB_CONTEXT" -n argocd get application platform-spoke-promtail \
+        -o jsonpath='{.spec.destination.server}' 2>/dev/null || echo "")
+    EXPECTED_PROMTAIL_DEST="https://${SPOKE_IP}:6443"
+    if [ "$PROMTAIL_DEST_SERVER" = "$EXPECTED_PROMTAIL_DEST" ]; then
+        ok "platform-spoke-promtail destination.server current ($EXPECTED_PROMTAIL_DEST)"
+    else
+        warn "platform-spoke-promtail destination.server stale: got ${PROMTAIL_DEST_SERVER:-<none>}, expected $EXPECTED_PROMTAIL_DEST"
+    fi
+
+    PROMTAIL_DS_HOSTNET=$(kubectl --context "$SPOKE_CONTEXT" -n monitoring get daemonset platform-spoke-promtail \
+        -o jsonpath='{.spec.template.spec.hostNetwork}' 2>/dev/null || echo "")
+    if [ "$PROMTAIL_DS_HOSTNET" = "true" ]; then
+        ok "platform-spoke-promtail DaemonSet has hostNetwork=true"
+    else
+        fail "platform-spoke-promtail DaemonSet missing hostNetwork=true (got: ${PROMTAIL_DS_HOSTNET:-<not found>}) — pod network cannot reach Hub Docker bridge IPs"
+    fi
+else
+    fail "Could not determine Hub container IP; skipping Promtail Loki IP drift checks"
 fi
 
 # =============================================================================
@@ -573,157 +463,81 @@ header "D.1 Spoke Cluster Network Recovery"
 SPOKE_NET_CHECK_POD="spoke-network-check"
 SPOKE_NET_CHECK_IP="10.96.0.1"
 
-run_spoke_clusterip_check() {
-    kubectl --context "$SPOKE_CONTEXT" -n default delete pod "$SPOKE_NET_CHECK_POD" --ignore-not-found > /dev/null 2>&1 || true
-    STATUS=$(kubectl --context "$SPOKE_CONTEXT" -n default run --quiet --rm -i --restart=Never "$SPOKE_NET_CHECK_POD" \
-        --image=curlimages/curl:latest -- sh -c "curl --max-time 5 --insecure -o /dev/null -s -w '%{http_code}' https://${SPOKE_NET_CHECK_IP}:443" 2>/dev/null || echo "000")
-    if [ -n "$STATUS" ] && [ "$STATUS" != "000" ]; then
-        return 0
-    fi
-    return 1
-}
-
-if run_spoke_clusterip_check; then
+kubectl --context "$SPOKE_CONTEXT" -n default delete pod "$SPOKE_NET_CHECK_POD" --ignore-not-found > /dev/null 2>&1 || true
+STATUS=$(kubectl --context "$SPOKE_CONTEXT" -n default run --quiet --rm -i --restart=Never "$SPOKE_NET_CHECK_POD" \
+    --image=curlimages/curl:latest -- sh -c "curl --max-time 5 --insecure -o /dev/null -s -w '%{http_code}' https://${SPOKE_NET_CHECK_IP}:443" 2>/dev/null || echo "000")
+if [ -n "$STATUS" ] && [ "$STATUS" != "000" ]; then
     ok "Spoke cluster internal service connectivity OK"
 else
-    fix "Spoke ClusterIP network broken; restarting spoke kube-proxy"
-    kubectl rollout restart daemonset/kube-proxy -n kube-system --context "$SPOKE_CONTEXT" > /dev/null 2>&1
-    kubectl rollout status daemonset/kube-proxy -n kube-system --context "$SPOKE_CONTEXT" --timeout=90s > /dev/null 2>&1
-    info "Waiting 15s for spoke kube-proxy to stabilise..."
-    sleep 15
-    if run_spoke_clusterip_check; then
-        ok "Spoke ClusterIP connectivity restored after kube-proxy restart"
-    else
-        fix "Spoke ClusterIP still broken; restarting spoke kindnet"
-        kubectl rollout restart daemonset/kindnet -n kube-system --context "$SPOKE_CONTEXT" > /dev/null 2>&1 || true
-        kubectl rollout status daemonset/kindnet -n kube-system --context "$SPOKE_CONTEXT" --timeout=90s > /dev/null 2>&1 || true
-        info "Waiting 15s for spoke kindnet to stabilise..."
-        sleep 15
-        if run_spoke_clusterip_check; then
-            ok "Spoke ClusterIP connectivity restored after kindnet restart"
-        else
-            fix "Spoke ClusterIP still broken; restarting spoke node containers"
-            docker restart helmsman-onprem-control-plane helmsman-onprem-worker > /dev/null 2>&1 || true
-            info "Waiting 30s for spoke node containers to fully restart"
-            sleep 30
-            # Ensure kube-proxy and kindnet are reloaded after container restart
-            kubectl rollout restart daemonset/kube-proxy -n kube-system --context "$SPOKE_CONTEXT" > /dev/null 2>&1 || true
-            kubectl rollout status daemonset/kube-proxy -n kube-system --context "$SPOKE_CONTEXT" --timeout=90s > /dev/null 2>&1 || true
-            kubectl rollout restart daemonset/kindnet -n kube-system --context "$SPOKE_CONTEXT" > /dev/null 2>&1 || true
-            kubectl rollout status daemonset/kindnet -n kube-system --context "$SPOKE_CONTEXT" --timeout=90s > /dev/null 2>&1 || true
-            info "Waiting 15s for spoke kube-proxy and kindnet to stabilise after container restart"
-            sleep 15
-            if run_spoke_clusterip_check; then
-                ok "Spoke ClusterIP connectivity restored after node container restart"
-            else
-                fail "Spoke ClusterIP connectivity still broken after node container restart"
-            fi
-        fi
-    fi
+    fail "Spoke ClusterIP network broken (kube-proxy/kindnet on spoke may need a restart)"
 fi
 
 # =============================================================================
 header "G. Argo CD CLI Login"
 # =============================================================================
-# Uses kubectl port-forward on port 9090 (HTTP/plaintext) rather than NodePort.
-# NodePort relies on kind host port mapping + kube-proxy iptables which are
-# unreliable after multiple Docker Desktop restarts.
-# Port-forward goes directly through the Kubernetes API — always works if
-# kubectl can reach the hub cluster (already verified in Phase C).
+# Uses a plain `kubectl port-forward` to a local port, then `argocd login
+# localhost:<port>`. The native `argocd login --port-forward` mode was tried
+# first but its --kube-context flag is not honored by ANY argocd subcommand
+# in this CLI version (login, app list, cluster list all silently fall back
+# to the current kubectl context) — this manual tunnel is what
+# dev-up-gemini.sh already uses successfully, so we mirror it here.
+# Read-only diagnostic session — nothing is synced or refreshed.
 
-# Kill any existing port-forward we started
-pkill -f "port-forward.*argocd-server.*9090" 2>/dev/null || true
-sleep 2
+ARGOCD_PF_PORT="9091"
+pkill -f "port-forward.*${ARGOCD_PF_PORT}" 2>/dev/null || true
+sleep 1
 
-# Start port-forward to the HTTPS port (443) using a local secure connection — avoids HTTP redirect and gRPC mismatch
-# Use nohup so the port-forward survives script exit and keeps localhost:9090 available
-nohup kubectl port-forward svc/argocd-server \
-    -n argocd --context "$HUB_CONTEXT" \
-    --address 127.0.0.1 9090:443 > /tmp/argocd-pf.log 2>&1 &
+if [ -z "$ARGOCD_PASS" ]; then
+    warn "No Argo CD admin password available (checked \$ARGOCD_PASS, $ARGOCD_PASS_FILE, argocd-initial-admin-secret)"
+fi
+
+ARGOCD_USER="${ARGOCD_USER:-admin}"
+ARGOCD_SERVER="localhost:${ARGOCD_PF_PORT}"
+
+kubectl --context "$HUB_CONTEXT" port-forward svc/argocd-server \
+    -n argocd "${ARGOCD_PF_PORT}":80 > /tmp/helmsman-sanity-argocd-pf.log 2>&1 &
 ARGOCD_PF_PID=$!
-echo "$ARGOCD_PF_PID" > /tmp/argocd-pf.pid
-sleep 5
+cleanup_pf() { kill "$ARGOCD_PF_PID" 2>/dev/null || true; }
+trap cleanup_pf EXIT
+sleep 3
 
 LOGIN_OK=false
 for i in 1 2 3; do
-    if argocd login localhost:9090 \
+    if argocd login "$ARGOCD_SERVER" \
         --username "$ARGOCD_USER" \
         --password "$ARGOCD_PASS" \
-        --insecure \
-        --grpc-web > /dev/null 2>&1; then
-        ok "Argo CD CLI session refreshed via port-forward :9090 (PID $ARGOCD_PF_PID)"
-        # Update argocd context URL so subsequent commands use 9090
-        ARGOCD_URL="localhost:9090"
+        --insecure > /dev/null 2>&1; then
+        ok "Argo CD CLI session authenticated via port-forward :${ARGOCD_PF_PORT}"
         LOGIN_OK=true
         break
     fi
-    info "Login attempt $i/3 — waiting 10s..."
-    sleep 10
+    info "Login attempt $i/3 — waiting 5s..."
+    sleep 5
 done
 
 if [ "$LOGIN_OK" = false ]; then
-    kill $ARGOCD_PF_PID 2>/dev/null || true
-    rm -f /tmp/argocd-pf.pid
-    fail "Argo CD CLI login failed via port-forward"
+    fail "Argo CD CLI login failed via port-forward :${ARGOCD_PF_PORT}"
     echo -e "  ${YELLOW}DEBUG:${NC} kubectl get pods -n argocd --context $HUB_CONTEXT"
-    echo -e "  ${YELLOW}DEBUG:${NC} cat /tmp/argocd-pf.log"
+    echo -e "  ${YELLOW}DEBUG:${NC} cat $ARGOCD_PASS_FILE"
 fi
 
 # =============================================================================
 header "H. Argo CD Cluster and App Status"
 # =============================================================================
-sleep 5
+sleep 3
 
-# Quick validation: ensure argocd-repo-server ClusterIP is reachable from the
-# application-controller; a common failure after Docker/kind restarts is that
-# kube-proxy/iptables leaves ClusterIP traffic broken causing ComparisonError.
-header "H.1 Argocd repo-server reachability"
-REPO_OK=true
-CTRLS=$(kubectl get pods -n argocd --context "$HUB_CONTEXT" -l app.kubernetes.io/name=argocd-application-controller -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
-for POD in $CTRLS; do
-    [ -z "$POD" ] && continue
-    if kubectl exec -n argocd --context "$HUB_CONTEXT" "$POD" -- bash -lc 'exec 3<>/dev/tcp/argocd-repo-server/8081 >/dev/null 2>&1' > /dev/null 2>&1; then
-        ok "argocd-repo-server reachable from $POD"
-    else
-        fail "argocd-repo-server unreachable from $POD"
-        REPO_OK=false
-    fi
-done
-
-if [ "$REPO_OK" = false ]; then
-    fix "Attempting auto-recovery for argocd-repo-server connectivity"
-    kubectl rollout restart daemonset/kube-proxy -n kube-system --context "$HUB_CONTEXT" > /dev/null 2>&1 || true
-    kubectl rollout status daemonset/kube-proxy -n kube-system --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1 || true
-    kubectl rollout restart deployment/argocd-repo-server -n argocd --context "$HUB_CONTEXT" > /dev/null 2>&1 || true
-    kubectl rollout status deployment/argocd-repo-server -n argocd --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1 || true
-    kubectl rollout restart deployment/argocd-application-controller -n argocd --context "$HUB_CONTEXT" > /dev/null 2>&1 || true
-    kubectl rollout status deployment/argocd-application-controller -n argocd --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1 || true
-    info "Waiting 15s for Argo CD components to stabilise..."
-    sleep 15
-fi
-
-# Use kubectl directly — no argocd CLI dependency for status checks
-info "Cluster Secret server URL stored in Argo CD:"
 STORED=$(kubectl get secret "$CLUSTER_SECRET_NAME" \
     -n argocd --context "$HUB_CONTEXT" \
     -o jsonpath='{.data.server}' 2>/dev/null | base64 -d 2>/dev/null || echo "unknown")
 info "  $STORED"
 
 if [ "$LOGIN_OK" = true ]; then
-    if [ "$NEEDS_SAMPLE_APP_RESYNC" = true ]; then
-        fix "Refreshing Argo CD app $SAMPLE_APP_APP_NAME to replay OIDC registrar hook and rebuild Vault data"
-        argocd app refresh "$SAMPLE_APP_APP_NAME" --hard > /dev/null 2>&1 || true
-        argocd app sync "$SAMPLE_APP_APP_NAME" --force --timeout 300 > /dev/null 2>&1 || true
-        argocd app wait "$SAMPLE_APP_APP_NAME" --for sync=Synced --for health=Healthy --timeout 300 > /dev/null 2>&1 || true
-        kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" rollout restart statefulset/sample-app > /dev/null 2>&1 || true
-        kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" rollout status statefulset/sample-app --timeout=180s > /dev/null 2>&1 || true
+    CLUSTER_JSON=$(argocd cluster list --server "$ARGOCD_SERVER" --insecure -o json 2>/dev/null || echo "[]")
+    if [ -z "$CLUSTER_JSON" ]; then
+        CLUSTER_JSON='[]'
     fi
-    CLUSTER_JSON=$(argocd cluster list -o json 2>/dev/null || echo "[]")
-        if [ -z "$CLUSTER_JSON" ]; then
-            CLUSTER_JSON='[]'
-        fi
 
-        CLUSTER_STATUS=$(echo "$CLUSTER_JSON" | python3 -c "
+    CLUSTER_STATUS=$(echo "$CLUSTER_JSON" | python3 -c "
 import json,sys
 try:
     clusters=json.load(sys.stdin)
@@ -736,7 +550,7 @@ for c in clusters:
 else:
     print('NotFound')
 " 2>/dev/null || echo "unknown")
-        CLUSTER_VERSION=$(echo "$CLUSTER_JSON" | python3 -c "
+    CLUSTER_VERSION=$(echo "$CLUSTER_JSON" | python3 -c "
 import json,sys
 try:
     clusters=json.load(sys.stdin)
@@ -752,12 +566,11 @@ for c in clusters:
         ok "Spoke cluster: Successful (Kubernetes $CLUSTER_VERSION)"
     elif [ "$CLUSTER_STATUS" = "Unknown" ]; then
         info "Spoke cluster: Unknown — still connecting, re-run in 60s"
-        ((PASS++))
     else
         fail "Spoke cluster: $CLUSTER_STATUS"
     fi
 
-    APP_JSON=$(argocd app list -o json 2>/dev/null || echo "[]")
+    APP_JSON=$(argocd app list --server "$ARGOCD_SERVER" --insecure -o json 2>/dev/null || echo "[]")
     APP_COUNT=$(echo "$APP_JSON" | python3 -c 'import json,sys
 try:
     apps=json.load(sys.stdin)
@@ -783,7 +596,7 @@ for app in apps:
             info "No Argo CD Applications found"
         else
             for APP_NAME in $APP_NAMES; do
-                APP_DATA=$(argocd app get "$APP_NAME" -o json 2>/dev/null || echo "{}")
+                APP_DATA=$(argocd app get "$APP_NAME" --server "$ARGOCD_SERVER" --insecure -o json 2>/dev/null || echo "{}")
                 APP_SYNC=$(printf '%s' "$APP_DATA" | python3 -c 'import json,sys
 try:
     app=json.load(sys.stdin)
@@ -809,55 +622,12 @@ except Exception:
     pass
 ')
 
-                if [ "$APP_SYNC" = "Unknown" ] && [ -n "$COMP_ERROR" ]; then
-                    info "App $APP_NAME has ComparisonError; restarting Argo CD internals and refreshing status"
-                    kubectl rollout restart deployment/argocd-repo-server \
-                        -n argocd --context "$HUB_CONTEXT" > /dev/null 2>&1
-                    kubectl rollout status deployment/argocd-repo-server \
-                        -n argocd --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1
-                    kubectl rollout restart deployment/argocd-application-controller \
-                        -n argocd --context "$HUB_CONTEXT" > /dev/null 2>&1
-                    kubectl rollout status deployment/argocd-application-controller \
-                        -n argocd --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1
-                    kubectl rollout restart deployment/argocd-server \
-                        -n argocd --context "$HUB_CONTEXT" > /dev/null 2>&1
-                    kubectl rollout status deployment/argocd-server \
-                        -n argocd --context "$HUB_CONTEXT" --timeout=90s > /dev/null 2>&1
-                    info "Argo CD server, repo-server, and application-controller restarted"
-                    argocd app refresh "$APP_NAME" > /dev/null 2>&1 || true
-                    sleep 15
-                    APP_DATA=$(argocd app get "$APP_NAME" -o json 2>/dev/null || echo "{}")
-                    APP_SYNC=$(printf '%s' "$APP_DATA" | python3 -c 'import json,sys
-try:
-    app=json.load(sys.stdin)
-    print(app.get("status",{}).get("sync",{}).get("status",""))
-except Exception:
-    print("")
-')
-                    APP_HEALTH=$(printf '%s' "$APP_DATA" | python3 -c 'import json,sys
-try:
-    app=json.load(sys.stdin)
-    print(app.get("status",{}).get("health",{}).get("status",""))
-except Exception:
-    print("")
-')
-                    COMP_ERROR=$(printf '%s' "$APP_DATA" | python3 -c 'import json,sys
-try:
-    app=json.load(sys.stdin)
-    for c in app.get("status",{}).get("conditions",[]):
-        if c.get("type") == "ComparisonError":
-            print(c.get("message",""))
-            break
-except Exception:
-    pass
-')
-                fi
-
                 if [ "$APP_SYNC" = "Synced" ] && [ "$APP_HEALTH" = "Healthy" ]; then
                     ok "App $APP_NAME — Synced / Healthy"
                 elif [ "$APP_SYNC" = "Synced" ] && [ "$APP_HEALTH" = "Progressing" ]; then
                     info "App $APP_NAME — Synced / Progressing"
-                    ((PASS++))
+                elif [ "$APP_SYNC" = "OutOfSync" ] && [ "$APP_HEALTH" = "Healthy" ]; then
+                    warn "App $APP_NAME — OutOfSync / Healthy"
                 elif [ "$APP_SYNC" = "Unknown" ]; then
                     if [ -n "$COMP_ERROR" ]; then
                         fail "App $APP_NAME — Unknown / $APP_HEALTH (ComparisonError: $COMP_ERROR)"
@@ -871,7 +641,7 @@ except Exception:
         fi
     fi
 else
-    # Fallback: use kubectl directly when argocd CLI is unavailable
+    # Fallback: use kubectl directly when argocd CLI login failed
     APP_COUNT=$(kubectl get applications -n argocd --context "$HUB_CONTEXT" \
         --no-headers 2>/dev/null | wc -l | tr -d ' ')
     info "Argo CD Applications in cluster: $APP_COUNT (login required for sync/health status)"
@@ -899,19 +669,14 @@ else
             RESTARTS=$(echo "$pod_line" | awk '{print $4}')
             if [ "$STATUS" = "Running" ]; then
                 if [ "${RESTARTS:-0}" -gt 5 ] 2>/dev/null; then
-                    info "Pod $NS/$POD_NAME Running $READY — high restarts ($RESTARTS)"
+                    warn "Pod $NS/$POD_NAME Running $READY — high restarts ($RESTARTS)"
                 else
                     ok "Pod $NS/$POD_NAME — Running $READY (restarts: $RESTARTS)"
                 fi
             elif [ "$STATUS" = "Completed" ] || [ "$STATUS" = "Succeeded" ]; then
                 ok "Pod $NS/$POD_NAME — $STATUS (one-shot pod)"
             elif [ "$STATUS" = "Terminating" ]; then
-                fix "Pod $NS/$POD_NAME Terminating — force deleting"
-                kubectl delete pod "$POD_NAME" -n "$NS" \
-                    --context "$SPOKE_CONTEXT" \
-                    --force --grace-period=0 > /dev/null 2>&1 && \
-                    ok "Force deleted: $NS/$POD_NAME" || \
-                    fail "Could not force delete: $NS/$POD_NAME"
+                warn "Pod $NS/$POD_NAME stuck Terminating"
             else
                 fail "Pod $NS/$POD_NAME — $STATUS $READY"
             fi
@@ -924,11 +689,11 @@ header "Summary"
 # =============================================================================
 echo ""
 echo -e "  ${GREEN}✔ Passed:${NC}  $PASS"
-[ "$FIXED" -gt 0 ] && echo -e "  ${YELLOW}⚙ Fixed:${NC}   $FIXED"
-[ "$FAIL" -gt 0  ] && echo -e "  ${RED}✘ Failed:${NC}  $FAIL"
+[ "$WARN" -gt 0 ] && echo -e "  ${YELLOW}⚠ Warnings:${NC} $WARN"
+[ "$FAIL" -gt 0 ] && echo -e "  ${RED}✘ Failed:${NC}  $FAIL"
 echo ""
 
-if [ "$FAIL" -eq 0 ]; then
+if [ "$FAIL" -eq 0 ] && [ "$WARN" -eq 0 ]; then
     echo -e "  ${GREEN}${BOLD}All checks passed. Helmsman environment is healthy.${NC}"
     echo -e "\n  ${CYAN}Quick commands:${NC}"
     echo -e "    argocd app list"
@@ -937,7 +702,11 @@ if [ "$FAIL" -eq 0 ]; then
     echo ""
     exit 0
 else
-    echo -e "  ${RED}${BOLD}$FAIL check(s) failed. Review output above.${NC}"
+    [ "$WARN" -gt 0 ] && echo -e "  ${YELLOW}${BOLD}$WARN item(s) drifted from expected state.${NC}"
+    [ "$FAIL" -gt 0 ] && echo -e "  ${RED}${BOLD}$FAIL check(s) failed.${NC}"
+    echo ""
+    echo -e "$RECOVER_HINT"
+    echo -e "  ${YELLOW}(add --reset if that doesn't clear it)${NC}"
     echo ""
     exit 1
 fi
