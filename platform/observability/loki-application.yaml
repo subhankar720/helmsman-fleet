@@ -39,6 +39,17 @@ spec:
               memory: 512Mi
           persistence:
             enabled: false
+          # persistence.enabled=false does NOT give Loki a writable /var/loki —
+          # the chart only mounts a volume there via a PVC (persistence.enabled=true)
+          # or these extraVolumes. Without one, /var/loki hits the container's
+          # read-only root filesystem and Loki crashes on startup (ruler-storage
+          # module: "mkdir /var/loki: read-only file system").
+          extraVolumes:
+            - name: storage
+              emptyDir: {}
+          extraVolumeMounts:
+            - name: storage
+              mountPath: /var/loki
         # Disable components not needed in SingleBinary mode
         read:
           replicas: 0
