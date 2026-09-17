@@ -31,7 +31,7 @@ spec:
           additionalDataSources:
             - name: Loki
               type: loki
-              url: http://loki.monitoring.svc.cluster.local:3100
+              url: http://platform-loki.monitoring.svc.cluster.local:3100
               access: proxy
         prometheus:
           prometheusSpec:
