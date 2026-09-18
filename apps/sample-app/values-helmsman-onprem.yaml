@@ -5,7 +5,7 @@ notifyChannel: "#helmsman-alerts"
 
 image:
   repository: ghcr.io/subhankar720/helmsman-app
-  tag: "latest"
+  tag: "a540577188c5a6db63366f155999f1572ec09d53"
 
 container:
   port: 8080
