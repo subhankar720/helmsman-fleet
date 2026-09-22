@@ -771,3 +771,37 @@ echo ""
 log_info "Spoke workloads:"
 kubectl --context "$SPOKE_CTX" get pods,externalsecret \
   -n sample-app 2>/dev/null || true
+
+echo ""
+log_info "Observability: Loki, Grafana, and log shipping..."
+
+LOKI_READY=$(kubectl --context "$HUB_CTX" get pod platform-loki-0 -n monitoring \
+  -o jsonpath='{.status.containerStatuses[?(@.name=="loki")].ready}' 2>/dev/null || echo "")
+if [ "$LOKI_READY" = "true" ]; then
+  log_ok "Loki is Ready"
+else
+  log_warn "Loki is not Ready (got: ${LOKI_READY:-<not found>})"
+fi
+
+GRAFANA_READY=$(kubectl --context "$HUB_CTX" get pods -n monitoring \
+  -l app.kubernetes.io/name=grafana \
+  -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="grafana")].ready}' 2>/dev/null || echo "")
+if [ "$GRAFANA_READY" = "true" ]; then
+  log_ok "Grafana is Ready"
+else
+  log_warn "Grafana is not Ready (got: ${GRAFANA_READY:-<not found>})"
+fi
+
+# The only check that proves Promtail is shipping right now, not just that
+# everything is configured correctly — query Loki for recent sample-app logs.
+kubectl --context "$HUB_CTX" -n monitoring delete pod loki-shipping-check --ignore-not-found > /dev/null 2>&1 || true
+NOW_NS=$(date +%s%N)
+FROM_NS=$((NOW_NS - 5*60*1000000000))
+SHIPPING_QUERY_URL="http://platform-loki.monitoring.svc.cluster.local:3100/loki/api/v1/query_range?query=%7Bnamespace%3D%22sample-app%22%7D&start=${FROM_NS}&end=${NOW_NS}&limit=1"
+SHIPPING_RESULT=$(kubectl --context "$HUB_CTX" -n monitoring run --quiet --rm -i --restart=Never loki-shipping-check \
+  --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 '${SHIPPING_QUERY_URL}'" 2>/dev/null || echo "")
+if echo "$SHIPPING_RESULT" | grep -q '"resultType":"streams"' && echo "$SHIPPING_RESULT" | grep -q '"values":\[\['; then
+  log_ok "Loki has sample-app log entries from the last 5 minutes — Promtail is shipping live"
+else
+  log_warn "No recent sample-app log entries in Loki — check platform-spoke-promtail (hostNetwork, clients.url) with ./scripts/helmsman-sanity.sh"
+fi
