@@ -45,6 +45,7 @@
 # G: Argo CD CLI login (read-only diagnostic session)
 # H: Argo CD cluster and app status
 # I: Spoke workload status
+# J: Observability — Loki, Grafana, and live log-shipping check
 # =============================================================================
 
 set -uo pipefail
@@ -682,6 +683,63 @@ else
             fi
         done <<< "$PODS"
     done
+fi
+
+# =============================================================================
+header "J. Observability: Loki, Grafana, and Log Shipping"
+# =============================================================================
+# Loki pod itself
+LOKI_READY=$(kubectl get pod platform-loki-0 -n monitoring --context "$HUB_CONTEXT" \
+    -o jsonpath='{.status.containerStatuses[?(@.name=="loki")].ready}' 2>/dev/null || echo "")
+if [ "$LOKI_READY" = "true" ]; then
+    ok "platform-loki-0 'loki' container is Ready"
+else
+    fail "platform-loki-0 'loki' container is not Ready (got: ${LOKI_READY:-<not found>})"
+fi
+
+# Loki /ready reachable in-cluster (in-cluster DNS, no IP drift involved)
+kubectl --context "$HUB_CONTEXT" -n monitoring delete pod loki-health-check --ignore-not-found > /dev/null 2>&1 || true
+if kubectl --context "$HUB_CONTEXT" -n monitoring run --quiet --rm -i --restart=Never loki-health-check \
+    --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 http://platform-loki.monitoring.svc.cluster.local:3100/ready" \
+    2>/dev/null | grep -q "ready"; then
+    ok "Loki /ready reachable at platform-loki.monitoring.svc.cluster.local:3100"
+else
+    fail "Loki /ready NOT reachable at platform-loki.monitoring.svc.cluster.local:3100"
+fi
+
+# Grafana pod + its Loki datasource points at the right service name
+GRAFANA_READY=$(kubectl get pods -n monitoring --context "$HUB_CONTEXT" \
+    -l app.kubernetes.io/name=grafana \
+    -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="grafana")].ready}' 2>/dev/null || echo "")
+if [ "$GRAFANA_READY" = "true" ]; then
+    ok "Grafana pod is Ready"
+else
+    fail "Grafana pod is not Ready (got: ${GRAFANA_READY:-<not found>})"
+fi
+
+GRAFANA_LOKI_DS_URL=$(kubectl get configmap platform-prometheus-stack-grafana-datasource \
+    -n monitoring --context "$HUB_CONTEXT" \
+    -o jsonpath='{.data.datasource\.yaml}' 2>/dev/null | grep -A2 "name: Loki" | grep "url:" | awk '{print $2}')
+EXPECTED_GRAFANA_LOKI_DS_URL="http://platform-loki.monitoring.svc.cluster.local:3100"
+if [ "$GRAFANA_LOKI_DS_URL" = "$EXPECTED_GRAFANA_LOKI_DS_URL" ]; then
+    ok "Grafana Loki datasource URL correct ($GRAFANA_LOKI_DS_URL)"
+else
+    fail "Grafana Loki datasource URL wrong: got '${GRAFANA_LOKI_DS_URL:-<none>}', expected '$EXPECTED_GRAFANA_LOKI_DS_URL' — re-apply platform/observability/kube-prometheus-stack-application.yaml (Applications here are kubectl-applied directly, git alone won't fix this)"
+fi
+
+# End-to-end: are logs from sample-app actually arriving in Loki, recently?
+# This is the only check that proves Promtail is shipping right now, not just
+# that everything is configured correctly.
+kubectl --context "$HUB_CONTEXT" -n monitoring delete pod loki-shipping-check --ignore-not-found > /dev/null 2>&1 || true
+NOW_NS=$(date +%s%N)
+FROM_NS=$((NOW_NS - 5*60*1000000000))
+SHIPPING_QUERY_URL="http://platform-loki.monitoring.svc.cluster.local:3100/loki/api/v1/query_range?query=%7Bnamespace%3D%22sample-app%22%7D&start=${FROM_NS}&end=${NOW_NS}&limit=1"
+SHIPPING_RESULT=$(kubectl --context "$HUB_CONTEXT" -n monitoring run --quiet --rm -i --restart=Never loki-shipping-check \
+    --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 '${SHIPPING_QUERY_URL}'" 2>/dev/null || echo "")
+if echo "$SHIPPING_RESULT" | grep -q '"resultType":"streams"' && echo "$SHIPPING_RESULT" | grep -q '"values":\[\['; then
+    ok "Loki has sample-app log entries from the last 5 minutes — Promtail is shipping live"
+else
+    fail "No sample-app log entries in Loki from the last 5 minutes — check the platform-spoke-promtail DaemonSet (hostNetwork, clients.url) and the F.2 section above"
 fi
 
 # =============================================================================

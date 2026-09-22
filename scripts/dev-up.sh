@@ -50,7 +50,7 @@ ARGOCD_PF_PORT="9090"               # port-forward port for argocd CLI
 ARGOCD_PF_PID=""
 
 KEYCLOAK_ADMIN_USER="admin"
-KEYCLOAK_ADMIN_PASS="helmsman123"   # must match keycloak-admin-credentials Secret
+KEYCLOAK_ADMIN_PASS="${KEYCLOAK_ADMIN_PASS:-admin}"   # must match keycloak-admin-credentials Secret
 VAULT_TOKEN="root"                  # dev mode root token
 
 FLEET_REPO="https://github.com/subhankar720/helmsman-fleet.git"
@@ -599,11 +599,37 @@ if $LOGIN_OK; then
   log_ok "Stale PreSync hook jobs cleaned up"
 
   # Sync application
+  # --timeout bounds how long this blocks waiting for PreSync hooks (e.g. the
+  # OIDC registration Job) to converge — without it, a hook stuck retrying
+  # (bad Keycloak credentials, network blip, etc.) hangs this script forever.
   if argocd app get sample-app-helmsman-onprem \
       --server "localhost:${ARGOCD_PF_PORT}" --insecure > /dev/null 2>&1; then
-    argocd app sync sample-app-helmsman-onprem --force \
-      --server "localhost:${ARGOCD_PF_PORT}" --insecure > /dev/null 2>&1 || true
-    log_ok "Sync triggered: sample-app-helmsman-onprem"
+    if argocd app sync sample-app-helmsman-onprem --force --timeout 120 \
+        --server "localhost:${ARGOCD_PF_PORT}" --insecure > /dev/null 2>&1; then
+      log_ok "Sync triggered: sample-app-helmsman-onprem"
+    else
+      log_warn "sample-app-helmsman-onprem sync did not complete within 120s — check: argocd app get sample-app-helmsman-onprem --server localhost:${ARGOCD_PF_PORT} --insecure"
+    fi
+  fi
+
+  # The sample-app-oidc-register PreSync hook writes a fresh issuer-url (with
+  # the current HUB_IP) into Vault every sync, but the already-running `adc`
+  # (oauth2-proxy) container has the OLD issuer-url baked into its process
+  # env from pod start — it will not pick up the new Secret value without an
+  # actual restart, and keeps CrashLoopBackOff-ing on stale-IP OIDC discovery
+  # until it does. Detect that and force a restart.
+  sleep 5
+  ADC_READY=$(kubectl --context "$SPOKE_CTX" get pod sample-app-0 -n sample-app \
+    -o jsonpath='{.status.containerStatuses[?(@.name=="adc")].ready}' 2>/dev/null || echo "")
+  if [ "$ADC_READY" != "true" ]; then
+    log_warn "sample-app-0 'adc' container not ready — likely stale OIDC issuer-url, restarting pod"
+    kubectl --context "$SPOKE_CTX" delete pod sample-app-0 -n sample-app --ignore-not-found > /dev/null 2>&1 || true
+    kubectl --context "$SPOKE_CTX" wait --for=condition=ready pod/sample-app-0 \
+      -n sample-app --timeout=60s > /dev/null 2>&1 && \
+      log_ok "sample-app-0 restarted and ready" || \
+      log_warn "sample-app-0 still not ready after restart — check: kubectl logs sample-app-0 -n sample-app -c adc --context $SPOKE_CTX"
+  else
+    log_ok "sample-app-0 'adc' container already ready"
   fi
 fi
 
