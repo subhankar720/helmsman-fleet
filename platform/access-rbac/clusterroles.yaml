@@ -1,0 +1,51 @@
+# Predefined ClusterRoles for Helmsman JIT access grants.
+# The AccessGrant controller creates namespace-scoped RoleBindings that
+# reference these ClusterRoles — giving scoped access without creating
+# per-namespace roles.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: helmsman-namespace-reader
+  labels:
+    app.kubernetes.io/managed-by: helmsman
+    helmsman.dev/access-role: "true"
+  annotations:
+    helmsman.dev/description: "Read-only access to all resources in a namespace"
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: helmsman-namespace-operator
+  labels:
+    app.kubernetes.io/managed-by: helmsman
+    helmsman.dev/access-role: "true"
+  annotations:
+    helmsman.dev/description: "Read-write access to workload resources in a namespace"
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Explicitly deny deletion at the operator level
+  # (admin permission is required for delete)
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: helmsman-namespace-admin
+  labels:
+    app.kubernetes.io/managed-by: helmsman
+    helmsman.dev/access-role: "true"
+  annotations:
+    helmsman.dev/description: "Full access including delete and RBAC within a namespace"
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
