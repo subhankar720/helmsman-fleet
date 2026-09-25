@@ -64,6 +64,9 @@ jobs:
 
   # ── Job 2: Auto-merge validated scaffold PRs ──────────────────────────────
   auto-merge:
+    permissions:
+      pull-requests: write
+      contents: write
     needs: validate
     runs-on: ubuntu-latest
     if: startsWith(github.head_ref, 'scaffold/')
