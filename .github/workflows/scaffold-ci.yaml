@@ -1,0 +1,203 @@
+name: Scaffold PR — Validate, Auto-merge, and Post Deployment Receipt
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'appdeployments/**'
+
+jobs:
+  # ── Job 1: Validate the AppDeployment CR ──────────────────────────────────
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      app_name: ${{ steps.parse.outputs.app_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          curl -sSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
+            -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
+
+      - name: Parse and validate changed AppDeployment files
+        id: parse
+        run: |
+          # Find changed AppDeployment files in this PR
+          CHANGED=$(git diff --name-only origin/main...HEAD -- appdeployments/)
+          echo "Changed files: $CHANGED"
+
+          for FILE in $CHANGED; do
+            if [ ! -f "$FILE" ]; then continue; fi
+
+            # Validate required fields
+            APP_NAME=$(yq '.spec.appName' "$FILE")
+            KIND=$(yq '.kind' "$FILE")
+            API=$(yq '.apiVersion' "$FILE")
+
+            echo "Validating $FILE: kind=$KIND apiVersion=$API appName=$APP_NAME"
+
+            if [ "$KIND" != "AppDeployment" ]; then
+              echo "ERROR: kind must be AppDeployment, got: $KIND"
+              exit 1
+            fi
+
+            if [ "$API" != "platform.helmsman.dev/v1alpha1" ]; then
+              echo "ERROR: apiVersion must be platform.helmsman.dev/v1alpha1"
+              exit 1
+            fi
+
+            if [ -z "$APP_NAME" ] || [ "$APP_NAME" = "null" ]; then
+              echo "ERROR: spec.appName is required"
+              exit 1
+            fi
+
+            echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+            echo "✅ $FILE is valid"
+          done
+
+  # ── Job 2: Auto-merge validated scaffold PRs ──────────────────────────────
+  auto-merge:
+    needs: validate
+    runs-on: ubuntu-latest
+    # Only auto-merge PRs that come from the scaffold CLI branch pattern
+    if: startsWith(github.head_ref, 'scaffold/')
+    steps:
+      - name: Auto-merge scaffold PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Auto-merging scaffold PR #${{ github.event.pull_request.number }}"
+          gh pr merge ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --squash \
+            --auto \
+            --subject "feat: scaffold ${{ needs.validate.outputs.app_name }}"
+
+  # ── Job 3: Poll for deployment and post receipt ───────────────────────────
+  deployment-receipt:
+    needs: [validate, auto-merge]
+    runs-on: ubuntu-latest
+    if: startsWith(github.head_ref, 'scaffold/')
+    steps:
+      - name: Wait for PR to merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Waiting for PR #${{ github.event.pull_request.number }} to merge..."
+          for i in $(seq 1 12); do
+            STATE=$(gh pr view ${{ github.event.pull_request.number }} \
+              --repo ${{ github.repository }} \
+              --json state -q '.state')
+            if [ "$STATE" = "MERGED" ]; then
+              echo "PR merged"
+              break
+            fi
+            echo "Attempt $i/12 — state: $STATE — waiting 15s..."
+            sleep 15
+          done
+
+      - name: Install kubectl
+        run: |
+          curl -sSL "https://dl.k8s.io/release/v1.33.0/bin/linux/amd64/kubectl" \
+            -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
+
+      - name: Write kubeconfig
+        env:
+          SPOKE_KUBECONFIG: ${{ secrets.SPOKE_KUBECONFIG }}
+        run: |
+          mkdir -p ~/.kube
+          echo "$SPOKE_KUBECONFIG" | base64 -d > ~/.kube/config
+          kubectl cluster-info
+
+      - name: Poll AppDeployment until READY
+        id: poll
+        env:
+          APP_NAME: ${{ needs.validate.outputs.app_name }}
+        run: |
+          echo "Polling AppDeployment/$APP_NAME for READY state..."
+          for i in $(seq 1 18); do
+            READY=$(kubectl get appdeployment "$APP_NAME" \
+              -n sample-app \
+              -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' \
+              2>/dev/null || echo "")
+
+            if [ "$READY" = "True" ]; then
+              echo "AppDeployment is READY"
+
+              # Extract all status fields
+              CLUSTER=$(kubectl get appdeployment "$APP_NAME" -n sample-app \
+                -o jsonpath='{.status.cluster}')
+              NAMESPACE=$(kubectl get appdeployment "$APP_NAME" -n sample-app \
+                -o jsonpath='{.status.namespace}')
+              ENDPOINT=$(kubectl get appdeployment "$APP_NAME" -n sample-app \
+                -o jsonpath='{.status.endpoint}')
+              OIDC_CLIENT=$(kubectl get appdeployment "$APP_NAME" -n sample-app \
+                -o jsonpath='{.status.oidcClientId}')
+              PHASE=$(kubectl get appdeployment "$APP_NAME" -n sample-app \
+                -o jsonpath='{.status.phase}')
+
+              echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
+              echo "namespace=$NAMESPACE" >> $GITHUB_OUTPUT
+              echo "endpoint=$ENDPOINT" >> $GITHUB_OUTPUT
+              echo "oidc_client=$OIDC_CLIENT" >> $GITHUB_OUTPUT
+              echo "phase=$PHASE" >> $GITHUB_OUTPUT
+              echo "deployed=true" >> $GITHUB_OUTPUT
+              break
+            fi
+
+            echo "Attempt $i/18 — READY=$READY — waiting 10s..."
+            sleep 10
+          done
+
+          if [ "${deployed:-false}" != "true" ]; then
+            echo "deployed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post deployment receipt as PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ needs.validate.outputs.app_name }}
+          DEPLOYED: ${{ steps.poll.outputs.deployed }}
+          CLUSTER: ${{ steps.poll.outputs.cluster }}
+          NAMESPACE: ${{ steps.poll.outputs.namespace }}
+          ENDPOINT: ${{ steps.poll.outputs.endpoint }}
+          OIDC_CLIENT: ${{ steps.poll.outputs.oidc_client }}
+          PHASE: ${{ steps.poll.outputs.phase }}
+        run: |
+          if [ "$DEPLOYED" = "true" ]; then
+            BODY="## ✅ Deployment Complete
+
+          **App:** \`$APP_NAME\`
+          **Phase:** $PHASE
+          **Cluster:** \`$CLUSTER\`
+          **Namespace:** \`$NAMESPACE\`
+          **Endpoint:** \`$ENDPOINT\`
+          **OIDC Client ID:** \`$OIDC_CLIENT\`
+          **Deployed at:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          Your application is live. It is OIDC-gated — users will be redirected to Keycloak login before reaching the app.
+
+          To view logs in Grafana:
+          \`\`\`
+          {namespace=\"$NAMESPACE\", app=\"$APP_NAME\"}
+          \`\`\`"
+          else
+            BODY="## ⚠️ Deployment Timed Out
+
+          The PR was merged but \`AppDeployment/$APP_NAME\` did not reach READY state within 3 minutes.
+
+          Check the operator logs:
+          \`\`\`
+          kubectl logs -n helmsman-operator-system deployment/helmsman-operator-controller-manager --tail=50
+          \`\`\`
+          Check the AppDeployment status:
+          \`\`\`
+          kubectl get appdeployment $APP_NAME -n sample-app -o jsonpath='{.status}' | python3 -m json.tool
+          \`\`\`"
+          fi
+
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --body "$BODY"
