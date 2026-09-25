@@ -535,6 +535,7 @@ for NS in $APP_NAMESPACES; do
     --from-literal=keycloak-realm="helmsman" \
     --from-literal=vault-url="http://${HUB_IP}:30082" \
     --from-literal=vault-token="$VAULT_TOKEN" \
+    --from-literal=cluster-name="$SPOKE_CLUSTER_NAME" \
     --dry-run=client -o yaml | \
     kubectl --context "$SPOKE_CTX" apply -f - > /dev/null 2>&1 || true
   log_ok "helmsman-platform-config updated in namespace: $NS"
