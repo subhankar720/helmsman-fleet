@@ -3,10 +3,12 @@ kind: Application
 metadata:
   name: platform-envoy-gateway
   namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
 spec:
   project: default
   source:
-    repoURL: oci://docker.io/envoyproxy
+    repoURL: docker.io/envoyproxy
     chart: gateway-helm
     targetRevision: "v1.3.1"
     helm:
@@ -21,7 +23,7 @@ spec:
                 cpu: "500m"
                 memory: "512Mi"
   destination:
-    server: https://kubernetes.default.svc
+    name: helmsman-onprem
     namespace: envoy-gateway-system
   syncPolicy:
     automated:

@@ -10,7 +10,7 @@ spec:
     targetRevision: main
     path: platform/envoy-gateway
     directory:
-      exclude: "argocd-application.yaml,spoke-application.yaml"
+      exclude: "{argocd-application.yaml,spoke-application.yaml}"
   destination:
     name: helmsman-onprem
     namespace: gateway-infra
@@ -21,3 +21,11 @@ spec:
     syncOptions:
       - CreateNamespace=true
       - ServerSideApply=true
+    # GatewayClass/Gateway CRDs come from platform-envoy-gateway;
+    # retry until that chart has installed them on the spoke.
+    retry:
+      limit: 10
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 3m
