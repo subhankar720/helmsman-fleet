@@ -1,0 +1,30 @@
+---
+# GatewayClass tells Kubernetes which controller manages Gateways
+# with this class. Deployed cluster-scoped on spoke.
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: envoy
+  labels:
+    app.kubernetes.io/managed-by: helmsman
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+# Shared Gateway — all platform apps attach HTTPRoutes to this.
+# Lives in gateway-infra namespace, not in app namespaces.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: helmsman-gateway
+  namespace: gateway-infra
+  labels:
+    app.kubernetes.io/managed-by: helmsman
+spec:
+  gatewayClassName: envoy
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: All    # allow HTTPRoutes from any namespace
