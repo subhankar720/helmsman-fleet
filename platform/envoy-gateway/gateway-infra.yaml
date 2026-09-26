@@ -9,6 +9,27 @@ metadata:
     app.kubernetes.io/managed-by: helmsman
 spec:
   controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: helmsman-proxy
+    namespace: gateway-infra
+---
+# kind has no LoadBalancer controller, so expose the Envoy proxy
+# as a NodePort; otherwise the Gateway never gets an address.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: helmsman-proxy
+  namespace: gateway-infra
+  labels:
+    app.kubernetes.io/managed-by: helmsman
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: NodePort
 ---
 # Shared Gateway — all platform apps attach HTTPRoutes to this.
 # Lives in gateway-infra namespace, not in app namespaces.
