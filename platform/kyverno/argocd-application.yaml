@@ -56,7 +56,7 @@ spec:
         webhooksCleanup:
           enabled: true
   destination:
-    server: https://kubernetes.default.svc
+    name: helmsman-onprem
     namespace: kyverno
   syncPolicy:
     automated:

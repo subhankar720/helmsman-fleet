@@ -12,7 +12,7 @@ spec:
     directory:
       exclude: "argocd-application.yaml"
   destination:
-    server: https://kubernetes.default.svc
+    name: helmsman-onprem
     namespace: kyverno
   syncPolicy:
     automated:
