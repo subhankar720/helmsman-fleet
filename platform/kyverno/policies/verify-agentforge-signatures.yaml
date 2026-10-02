@@ -1,0 +1,32 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-agentforge-signatures
+  annotations:
+    policies.kyverno.io/title: Verify AgentForge Image Signatures
+    policies.kyverno.io/description: >
+      All AgentForge container images must be signed with cosign
+      using the Helmsman platform signing key. Unsigned images
+      from ghcr.io/subhankar720/agentforge* are rejected.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: verify-agentforge-image-signatures
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              namespaces: ["agentforge"]
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/subhankar720/agentforge*"
+          attestors:
+            - count: 1
+              entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEeEQgpLf1sQk7Pm9pAWhsJrNFUn3G
+                      VjRdGeAlqOtBibJXZfYHVkJYbqu8kt4xKivzw93kD9pwDyspv+AvrWujwA==
+                      -----END PUBLIC KEY-----
