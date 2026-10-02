@@ -1,0 +1,23 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-agentforge-oauth2proxy
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/subhankar720/helmsman-fleet.git
+    targetRevision: main
+    path: platform/oauth2-proxy-agentforge
+    directory:
+      exclude: "argocd-application.yaml"
+  destination:
+    name: helmsman-onprem
+    namespace: gateway-infra
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
