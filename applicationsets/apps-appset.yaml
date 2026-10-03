@@ -14,6 +14,10 @@ spec:
               revision: main
               directories:
                 - path: "apps/*"
+                # agentforge ships its own Helm chart and Argo CD Application
+                # (apps/agentforge/argocd-application.yaml), not golden-path values
+                - path: "apps/agentforge"
+                  exclude: true
           # Generator 2: finds every Argo CD registered cluster
           # that has the label platform-enabled=true.
           # Adding a new cluster = labelling it and Argo CD fans out automatically.

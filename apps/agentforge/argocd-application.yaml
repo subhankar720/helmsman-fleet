@@ -21,3 +21,7 @@ spec:
     syncOptions:
       - CreateNamespace=true
       - ServerSideApply=true
+    # Kyverno policies target namespaces with this label
+    managedNamespaceMetadata:
+      labels:
+        helmsman.dev/managed: "true"

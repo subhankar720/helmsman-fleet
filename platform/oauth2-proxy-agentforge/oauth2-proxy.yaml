@@ -55,7 +55,7 @@ spec:
           args:
             # OIDC provider — Keycloak helmsman realm
             - --provider=oidc
-            - --oidc-issuer-url=http://$(KEYCLOAK_URL)/realms/helmsman
+            - --oidc-issuer-url=$(KEYCLOAK_URL)/realms/helmsman   # keycloak-url already includes http://
             - --client-id=agentforge-gateway
             # Upstream — AgentForge gateway service in agentforge namespace
             # Cross-namespace: use FQDN
