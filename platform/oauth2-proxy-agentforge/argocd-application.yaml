@@ -3,6 +3,10 @@ kind: Application
 metadata:
   name: platform-agentforge-oauth2proxy
   namespace: argocd
+  annotations:
+    # ExternalSecret/HTTPRoute get server-side defaults (conversionStrategy,
+    # backendRef kind/weight, ...) that a client-side diff reports as drift
+    argocd.argoproj.io/compare-options: ServerSideDiff=true
 spec:
   project: default
   source:
