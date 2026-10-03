@@ -455,6 +455,28 @@ kubectl --context "$SPOKE_CTX" get nodes --no-headers > /dev/null 2>&1 && \
 # silently drops traffic into namespaces that have policies (sample-app).
 log_step "Stage 3: Network Recovery"
 
+# kind ships kindnet with a 100m CPU limit. kindnet also enforces
+# NetworkPolicy by judging every new pod connection in userspace (nfqueue),
+# and at 100m it was CPU-throttled in >99% of periods: API watches timed out
+# and queued connections stalled (Argo CD/CoreDNS on the hub, sample-app on
+# the spoke). Give it real headroom; kind re-creates it with the default on
+# --reset, so this is enforced on every run.
+KINDNET_RESOURCES='{"requests":{"cpu":"100m","memory":"50Mi"},"limits":{"cpu":"1","memory":"256Mi"}}'
+for NET_CTX in "$HUB_CTX" "$SPOKE_CTX"; do
+  KINDNET_CPU_LIMIT=$(kubectl --context "$NET_CTX" -n kube-system get ds kindnet \
+    -o jsonpath='{.spec.template.spec.containers[0].resources.limits.cpu}' 2>/dev/null || echo "")
+  if [ "$KINDNET_CPU_LIMIT" = "1" ]; then
+    log_ok "kindnet CPU limit OK on $NET_CTX"
+  elif kubectl --context "$NET_CTX" -n kube-system patch ds kindnet --type=json \
+      -p="[{\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/resources\",\"value\":${KINDNET_RESOURCES}}]" \
+      > /dev/null 2>&1; then
+    kubectl --context "$NET_CTX" -n kube-system rollout status ds/kindnet --timeout=120s > /dev/null 2>&1 || true
+    log_ok "kindnet CPU limit raised ${KINDNET_CPU_LIMIT:-?} → 1 on $NET_CTX"
+  else
+    log_warn "Could not patch kindnet resources on $NET_CTX"
+  fi
+done
+
 for NET_CTX in "$HUB_CTX" "$SPOKE_CTX"; do
   NET_LABEL=$([ "$NET_CTX" = "$HUB_CTX" ] && echo Hub || echo Spoke)
   COREDNS_READY=$(kubectl --context "$NET_CTX" get pods -n kube-system \

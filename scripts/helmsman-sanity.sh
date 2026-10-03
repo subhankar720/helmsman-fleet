@@ -490,6 +490,15 @@ fi
 # rules and silently drops traffic into namespaces with policies (sample-app)
 # while everything else looks healthy.
 for NET_CTX in "$HUB_CONTEXT" "$SPOKE_CONTEXT"; do
+    # kind's default 100m CPU limit starves kindnet's NetworkPolicy dataplane
+    KINDNET_CPU_LIMIT=$(kubectl --context "$NET_CTX" -n kube-system get ds kindnet \
+        -o jsonpath='{.spec.template.spec.containers[0].resources.limits.cpu}' 2>/dev/null || echo "")
+    if [ "$KINDNET_CPU_LIMIT" = "1" ]; then
+        ok "kindnet CPU limit 1 on $NET_CTX"
+    else
+        fail "kindnet CPU limit on $NET_CTX is '${KINDNET_CPU_LIMIT:-<none>}' (kind default 100m throttles NetworkPolicy enforcement) — dev-up-gemini.sh Stage 3 raises it"
+    fi
+
     KINDNET_ERRS=$(kubectl --context "$NET_CTX" logs -n kube-system -l app=kindnet \
         --since=10m --tail=-1 2>/dev/null | grep -c "Failed to watch" || true)
     if [ "${KINDNET_ERRS:-0}" -eq 0 ] 2>/dev/null; then

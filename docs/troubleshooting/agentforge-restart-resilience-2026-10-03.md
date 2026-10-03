@@ -30,7 +30,7 @@ Half of these would not have survived the next Docker restart.
 | `ghcr-pull-secret` | Survives a restart, lost on `--reset`. The token isn't in git. | Backed up to `~/.helmsman-dev/ghcr-pull-secret.json` and restored. |
 | `agentforge` namespace label | Set by hand. | Owned by the Application (`managedNamespaceMetadata`) and re-applied by dev-up. |
 | Envoy Gateway, Kyverno policy, oauth2-proxy manifests | In git. | dev-up recreates any missing Application (they're kubectl-applied) and repairs an unprogrammed Gateway. |
-| kindnet NetworkPolicy enforcement | Loses its API watch and drops traffic into `sample-app`. Only the hub was ever reset. | Stage 3 restarts kube-proxy, kindnet and CoreDNS on **both** clusters when kindnet logs `Failed to watch`. |
+| kindnet NetworkPolicy enforcement | CPU-starved at kind's 100m default: loses its API watch, stalls Argo CD/CoreDNS traffic on the hub and drops traffic into `sample-app`. | Stage 3 sets a 1-CPU limit on both clusters, and restarts kube-proxy, kindnet and CoreDNS when kindnet still logs `Failed to watch`. |
 
 ## Issue 1: Vault and Keycloak forget everything written at runtime
 
@@ -144,27 +144,49 @@ dev-up Stage 3 now checks both clusters and restarts kube-proxy, kindnet and Cor
 these is true: the containers were restarted, CoreDNS isn't running, or kindnet has logged
 `Failed to watch` in the last 10 minutes. The sanity script reports kindnet watch health in D.1.
 
-### Issue 5, follow-up: restarting kindnet is only temporary
+### Issue 5, root cause: kindnet CPU-starved by kind's default 100m limit
 
-Within minutes of a restart, kindnet on both clusters logged `Failed to watch` again, and traffic
-into `sample-app` was dropped again. The connection from the node to the API server is what keeps
-failing (`dial tcp 172.18.0.5:6443: i/o timeout`, and `lookup helmsman-hub-control-plane: i/o
-timeout` from Docker's DNS). Meanwhile `dmesg` on the nodes shows
-`WSL … Relay ERROR: UtilAcceptVsock: Waiting for abnormally long accept`. So the base flakiness is
-the Docker Desktop / WSL network, which none of these scripts can fix.
-
-kindnet makes it much worse because it enforces NetworkPolicy itself. It sends new pod connections
-through an nfqueue (`queue 101`) and decides from its own cache of pods and policies. When the
-watch drops, that cache goes stale and connections are dropped or held:
+Restarting kindnet only helped for a few minutes. Its logs gave the real cause away: lines that
+should be milliseconds apart were 2–5 seconds apart. kind ships kindnet with
+`limits: {cpu: 100m, memory: 50Mi}`, and kindnet enforces NetworkPolicy by sending every new pod
+connection through an nfqueue (`queue 101`) and deciding allow/deny in userspace. At 100m it was
+throttled almost all the time:
 
 ```
+# /sys/fs/cgroup/<kindnet>/cpu.stat, before
+helmsman-onprem-worker  nr_periods 41114  nr_throttled 40920
+helmsman-hub-worker2    nr_periods 41358  nr_throttled 41202     # 99.6 %
 docker exec helmsman-hub-worker2 cat /proc/net/netfilter/nfnetlink_queue
-  101 … 222 …          # 222 packets waiting for a verdict
+  101 … 222 …                                                  # 222 packets waiting for a verdict
 ```
 
-The hub runs the 7 NetworkPolicies from Argo CD's upstream install, and `hub-worker2` hosts
-`argocd-redis`, `argocd-dex-server`, Keycloak, Vault and CoreDNS. This is the most likely cause of
-the earlier `argocd-server` DNS timeouts and the 111 `argocd-repo-server` liveness-probe restarts.
+A starved kindnet can't finish TLS handshakes to the API server in time (that's the `Failed to watch`
+errors), so its pod/policy cache goes stale and queued connections stall or are denied. The hub
+runs the 7 NetworkPolicies from Argo CD's upstream install, and `hub-worker2` hosts `argocd-redis`,
+`argocd-dex-server`, Keycloak, Vault and CoreDNS. This also explains the earlier `argocd-server`
+DNS timeouts and the 111 `argocd-repo-server` liveness-probe restarts. The occasional
+`WSL … UtilAcceptVsock` relay errors in `dmesg` are real, but they're secondary.
+
+**Fix**
+
+Raise the limit to `cpu: 1, memory: 256Mi` on both clusters. NetworkPolicy enforcement stays on,
+because the golden-path policies are a Helmsman feature. dev-up Stage 3 enforces the limit on every
+run, since `--reset` recreates kindnet with kind's default. The sanity script checks it in D.1.
+
+```
+kubectl --context <ctx> -n kube-system patch ds kindnet --type=json -p='[{"op":"replace",
+  "path":"/spec/template/spec/containers/0/resources","value":{"requests":{"cpu":"100m",
+  "memory":"50Mi"},"limits":{"cpu":"1","memory":"256Mi"}}}]'
+```
+
+Watched for 10 minutes afterwards, sampled once a minute:
+
+| | Before | After |
+| --- | --- | --- |
+| kindnet throttled periods (hub-worker2) | 41202 / 41358 | 1 / 275 |
+| kindnet `Failed to watch` errors | every 1–3 min | 0 |
+| nfqueue packets waiting (hub-worker2) | 222 | 0 |
+| probe into `sample-app` `/ping` | 000 (dropped) | 200 every sample |
 
 ## Issue 6: sanity probes blocked by Kyverno
 
@@ -208,11 +230,11 @@ Argo CD apps were Synced/Healthy, and the `agentforge-helmsman-onprem` duplicate
 
 **`helmsman-sanity.sh` section K.** 33 of 33 checks passed.
 
+**Final full `helmsman-sanity.sh` run (after the kindnet fix).** 104 passed, 0 failed, 2 warnings.
+The warnings are External Secrets restart counts left over from 2026-09-21.
+
 ## Open items
 
-- **kindnet NetworkPolicy enforcement on a flaky Docker network** (Issue 5 follow-up). This needs a
-  decision: disable kindnet's policy enforcement in these kind clusters, or keep it and live with
-  intermittent drops between dev-up runs.
 
 - **Hub Kyverno is orphaned.** Commit `02f647f` moved Kyverno to the spoke, but the hub still runs
   the Kyverno controllers and 6 ClusterPolicies, which no Application manages any more.
