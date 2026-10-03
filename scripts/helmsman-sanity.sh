@@ -30,6 +30,9 @@
 # 7. Applications → destination.server has old IP → InvalidSpecError
 # 8. platform-spoke-promtail → applied directly (no app-of-apps), so its
 #    hardcoded clients.url/destination.server go stale on IP drift too
+# 9. Vault (-dev, in-memory) and Keycloak (no PVC) lose everything written at
+#    runtime: secret/agentforge/* and the agentforge-gateway client, groups and
+#    users. oauth2-proxy then keeps a stale issuer/secret until restarted
 #
 # REPORT ORDER
 # ------------
@@ -46,6 +49,8 @@
 # H: Argo CD cluster and app status
 # I: Spoke workload status
 # J: Observability — Loki, Grafana, and live log-shipping check
+# K: AgentForge platform — Envoy Gateway, oauth2-proxy, Keycloak client/groups/
+#    user, Vault secret/agentforge/*, Kyverno policy, namespace + pull secret
 # =============================================================================
 
 set -uo pipefail
@@ -92,6 +97,14 @@ header(){ echo -e "\n${BOLD}${BLUE}── $1 ──${NC}"; }
 
 echo -e "\n${BOLD}Helmsman Sanity Report${NC} — $(date '+%Y-%m-%d %H:%M:%S')"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+# Throwaway curl pods used by the checks below. Namespaces labelled
+# helmsman.dev/managed=true (e.g. sample-app) are guarded by the Kyverno
+# policies on the spoke, which reject a bare `kubectl run` — so give the probe
+# the label, non-root user, limits and no-privilege-escalation they require.
+probe_overrides() {
+    printf '{"metadata":{"labels":{"app.kubernetes.io/managed-by":"helmsman"}},"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":100},"containers":[{"name":"%s","resources":{"limits":{"cpu":"100m","memory":"64Mi"}},"securityContext":{"allowPrivilegeEscalation":false}}]}}' "$1"
+}
 
 RECOVER_HINT="  ${YELLOW}→ Fix with:${NC} cd ~/projects/helmsman/helmsman-operator && ./dev-up-gemini.sh"
 
@@ -375,7 +388,7 @@ if [ -n "$HUB_IP" ]; then
             fail "sample-app Service targetPort is not 4180 (got: $SERVICE_PORT)"
         fi
         kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" delete pod sample-app-probe --ignore-not-found > /dev/null 2>&1 || true
-        if kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" run --quiet --rm -i --restart=Never sample-app-probe --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 http://$SAMPLE_APP_SERVICE_NAME:80/ping" > /dev/null 2>&1; then
+        if kubectl --context "$SPOKE_CONTEXT" -n "$SAMPLE_APP_NAMESPACE" run --quiet --rm -i --restart=Never sample-app-probe --image=curlimages/curl:latest --override-type=strategic --overrides="$(probe_overrides sample-app-probe)" -- sh -c "curl -fsS --max-time 5 http://$SAMPLE_APP_SERVICE_NAME:80/ping" > /dev/null 2>&1; then
             ok "OIDC sidecar /ping endpoint reachable through sample-app service"
         else
             fail "OIDC sidecar /ping endpoint not reachable through sample-app service"
@@ -398,7 +411,7 @@ if [ -n "$HUB_IP" ]; then
     if [ -z "$CSS_SERVER" ]; then
         fail "ClusterSecretStore 'vault-backend' not found in spoke cluster"
     else
-        if kubectl --context "$SPOKE_CONTEXT" -n sample-app run --quiet --rm -i --restart=Never vault-check --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 ${CSS_SERVER}/v1/sys/health" > /dev/null 2>&1; then
+        if kubectl --context "$SPOKE_CONTEXT" -n sample-app run --quiet --rm -i --restart=Never vault-check --image=curlimages/curl:latest --override-type=strategic --overrides="$(probe_overrides vault-check)" -- sh -c "curl -fsS --max-time 5 ${CSS_SERVER}/v1/sys/health" > /dev/null 2>&1; then
             ok "ClusterSecretStore vault-backend server ($CSS_SERVER) reachable from spoke"
         else
             fail "ClusterSecretStore vault-backend server ($CSS_SERVER) NOT reachable from spoke (expected $EXPECTED_VAULT_NODEPORT_URL)"
@@ -472,6 +485,19 @@ if [ -n "$STATUS" ] && [ "$STATUS" != "000" ]; then
 else
     fail "Spoke ClusterIP network broken (kube-proxy/kindnet on spoke may need a restart)"
 fi
+
+# kindnet enforces NetworkPolicy. If it loses its API watch it keeps stale
+# rules and silently drops traffic into namespaces with policies (sample-app)
+# while everything else looks healthy.
+for NET_CTX in "$HUB_CONTEXT" "$SPOKE_CONTEXT"; do
+    KINDNET_ERRS=$(kubectl --context "$NET_CTX" logs -n kube-system -l app=kindnet \
+        --since=10m --tail=-1 2>/dev/null | grep -c "Failed to watch" || true)
+    if [ "${KINDNET_ERRS:-0}" -eq 0 ] 2>/dev/null; then
+        ok "kindnet API watch healthy on $NET_CTX"
+    else
+        fail "kindnet on $NET_CTX logged $KINDNET_ERRS 'Failed to watch' errors in 10m — NetworkPolicy enforcement is stale (dev-up-gemini.sh Stage 3 restarts kindnet)"
+    fi
+done
 
 # =============================================================================
 header "G. Argo CD CLI Login"
@@ -741,6 +767,257 @@ if echo "$SHIPPING_RESULT" | grep -q '"resultType":"streams"' && echo "$SHIPPING
 else
     fail "No sample-app log entries in Loki from the last 5 minutes — check the platform-spoke-promtail DaemonSet (hostNetwork, clients.url) and the F.2 section above"
 fi
+
+# =============================================================================
+header "K. AgentForge Platform (Envoy Gateway, oauth2-proxy, Keycloak, Vault)"
+# =============================================================================
+# Vault runs in -dev mode (in-memory) and Keycloak has no PVC, so a Docker
+# restart wipes secret/agentforge/* and the agentforge-gateway client, groups
+# and users. dev-up-gemini.sh Stage 10.5 restores them from ~/.helmsman-dev/;
+# this section only reports.
+AF_FIX="dev-up-gemini.sh Stage 10.5 repairs this"
+AF_STATE_DIR="${HELMSMAN_STATE_DIR:-$HOME/.helmsman-dev}"
+
+# --- Argo CD Applications (kubectl-applied — git alone can't recreate them) ---
+for APP in platform-envoy-gateway platform-envoy-gateway-infra platform-agentforge-oauth2proxy \
+           platform-kyverno-policies agentforge; do
+    if kubectl --context "$HUB_CONTEXT" -n argocd get application "$APP" > /dev/null 2>&1; then
+        ok "Application $APP exists"
+    else
+        fail "Application $APP missing in argocd namespace — $AF_FIX"
+    fi
+done
+
+# --- Envoy Gateway ------------------------------------------------------------
+EG_READY=$(kubectl --context "$SPOKE_CONTEXT" -n envoy-gateway-system get deployment envoy-gateway \
+    -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "")
+[ "${EG_READY:-0}" -ge 1 ] 2>/dev/null && ok "Envoy Gateway controller Running on spoke" || \
+    fail "Envoy Gateway controller not ready in envoy-gateway-system"
+
+GC_ACCEPTED=$(kubectl --context "$SPOKE_CONTEXT" get gatewayclass envoy \
+    -o jsonpath='{.status.conditions[?(@.type=="Accepted")].status}' 2>/dev/null || echo "")
+[ "$GC_ACCEPTED" = "True" ] && ok "GatewayClass envoy Accepted" || \
+    fail "GatewayClass envoy not Accepted (got: ${GC_ACCEPTED:-<not found>})"
+
+GW_PROGRAMMED=$(kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get gateway helmsman-gateway \
+    -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || echo "")
+GW_ADDR=$(kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get gateway helmsman-gateway \
+    -o jsonpath='{.status.addresses[0].value}' 2>/dev/null || echo "")
+if [ "$GW_PROGRAMMED" = "True" ]; then
+    ok "Gateway gateway-infra/helmsman-gateway Programmed (address ${GW_ADDR:-none})"
+else
+    fail "Gateway helmsman-gateway not Programmed (got: ${GW_PROGRAMMED:-<not found>}) — $AF_FIX"
+fi
+
+GW_SVC=$(kubectl --context "$SPOKE_CONTEXT" -n envoy-gateway-system get svc \
+    -l gateway.envoyproxy.io/owning-gateway-name=helmsman-gateway,gateway.envoyproxy.io/owning-gateway-namespace=gateway-infra \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+GW_SVC_TYPE=$(kubectl --context "$SPOKE_CONTEXT" -n envoy-gateway-system get svc "$GW_SVC" \
+    -o jsonpath='{.spec.type}' 2>/dev/null || echo "")
+if [ "$GW_SVC_TYPE" = "NodePort" ]; then
+    ok "Gateway proxy Service $GW_SVC is NodePort (kind has no LoadBalancer)"
+else
+    fail "Gateway proxy Service type is '${GW_SVC_TYPE:-<not found>}', expected NodePort — check EnvoyProxy gateway-infra/helmsman-proxy"
+fi
+
+ROUTE_STATUS=$(kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get httproute agentforge-gateway-route \
+    -o jsonpath='{range .status.parents[0].conditions[*]}{.type}={.status} {end}' 2>/dev/null || echo "")
+if echo "$ROUTE_STATUS" | grep -q "Accepted=True" && echo "$ROUTE_STATUS" | grep -q "ResolvedRefs=True"; then
+    ok "HTTPRoute agentforge-gateway-route Accepted, backend resolved"
+else
+    fail "HTTPRoute agentforge-gateway-route not healthy (${ROUTE_STATUS:-not found})"
+fi
+
+# --- oauth2-proxy -------------------------------------------------------------
+GI_KC_URL=$(kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get secret helmsman-platform-config \
+    -o jsonpath='{.data.keycloak-url}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+if [ "$GI_KC_URL" = "http://${HUB_IP}:30081" ]; then
+    ok "gateway-infra helmsman-platform-config keycloak-url current ($GI_KC_URL)"
+else
+    fail "gateway-infra helmsman-platform-config keycloak-url is '${GI_KC_URL:-<missing>}', expected http://${HUB_IP}:30081 — $AF_FIX"
+fi
+
+ES_READY=$(kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get externalsecret agentforge-oauth2-proxy-secret \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+[ "$ES_READY" = "True" ] && ok "ExternalSecret agentforge-oauth2-proxy-secret Ready" || \
+    fail "ExternalSecret agentforge-oauth2-proxy-secret not Ready (got: ${ES_READY:-<not found>})"
+
+OAUTH_AVAILABLE=$(kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get deployment agentforge-oauth2-proxy \
+    -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || echo "")
+[ "$OAUTH_AVAILABLE" = "True" ] && ok "oauth2-proxy Deployment Available" || \
+    fail "oauth2-proxy Deployment not Available (got: ${OAUTH_AVAILABLE:-<not found>})"
+
+# Same fingerprint dev-up records after restarting oauth2-proxy: if the URL
+# or credentials changed since, the running process still has the old ones.
+OAUTH_FP=$( {
+    kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get secret helmsman-platform-config -o jsonpath='{.data.keycloak-url}' 2>/dev/null
+    kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get secret agentforge-oauth2-proxy-secret -o jsonpath='{.data}' 2>/dev/null
+  } | sha256sum | cut -c1-16)
+RUNNING_FP=$(kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get deployment agentforge-oauth2-proxy \
+    -o jsonpath='{.metadata.annotations.helmsman\.dev/config-fingerprint}' 2>/dev/null || echo "")
+if [ "$OAUTH_FP" = "$RUNNING_FP" ]; then
+    ok "oauth2-proxy started with the current Keycloak URL and credentials"
+else
+    warn "oauth2-proxy config changed since it last started (or was never recorded) — needs a restart; $AF_FIX"
+fi
+
+if [ -n "$GW_SVC" ]; then
+    GW_URL="http://${GW_SVC}.envoy-gateway-system.svc.cluster.local"
+    for attempt in 1 2 3; do   # a throwaway probe pod can fail on its own; retry before reporting
+        kubectl --context "$SPOKE_CONTEXT" -n default delete pod agentforge-gw-check --ignore-not-found > /dev/null 2>&1 || true
+        AF_E2E=$(kubectl --context "$SPOKE_CONTEXT" -n default run --quiet --rm -i --restart=Never agentforge-gw-check \
+            --image=curlimages/curl:latest -- sh -c "
+              curl -s -o /dev/null -w 'ping=%{http_code}\n' --max-time 5 -H 'Host: agentforge.helmsman.local' '${GW_URL}/ping'
+              curl -s -o /dev/null -w 'start=%{http_code} %{redirect_url}\n' --max-time 5 -H 'Host: agentforge.helmsman.local' '${GW_URL}/oauth2/start'
+            " 2>/dev/null || echo "")
+        echo "$AF_E2E" | grep -q '^ping=200' && echo "$AF_E2E" | grep -q "^start=302 http://${HUB_IP}:30081/" && break
+        sleep 5
+    done
+    if echo "$AF_E2E" | grep -q '^ping=200'; then
+        ok "agentforge.helmsman.local → Envoy Gateway → oauth2-proxy (/ping 200)"
+    else
+        fail "Gateway → oauth2-proxy /ping failed (${AF_E2E:-no response})"
+    fi
+    if echo "$AF_E2E" | grep -q "^start=302 http://${HUB_IP}:30081/realms/helmsman/"; then
+        ok "oauth2-proxy login redirects to current Keycloak (http://${HUB_IP}:30081/realms/helmsman)"
+    else
+        fail "oauth2-proxy login redirect is not the current Keycloak ($(echo "$AF_E2E" | grep '^start=' || echo 'no response')) — stale issuer; $AF_FIX"
+    fi
+else
+    fail "No Envoy proxy Service for helmsman-gateway — cannot test the AgentForge route"
+fi
+
+# --- Vault: secret/agentforge/* -----------------------------------------------
+VAULT_POD=$(kubectl --context "$HUB_CONTEXT" -n vault get pods --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+AF_VAULT_CS=""
+if [ -z "$VAULT_POD" ]; then
+    fail "No running Vault pod on hub"
+else
+    for P in auth llm db cache confluence; do
+        DATA=$(kubectl --context "$HUB_CONTEXT" -n vault exec "$VAULT_POD" -- \
+            env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN="${VAULT_TOKEN:-root}" \
+            vault kv get -format=json "secret/agentforge/$P" 2>/dev/null || echo "")
+        if [ -z "$DATA" ]; then
+            fail "Vault secret/agentforge/$P missing — $AF_FIX"
+            continue
+        fi
+        if [ "$P" = "auth" ]; then
+            AUTH_CHECK=$(printf '%s' "$DATA" | HUB_IP="$HUB_IP" python3 -c '
+import json, os, sys
+d = json.load(sys.stdin)["data"]["data"]
+need = ["keycloak_client_id", "keycloak_client_secret", "cookie_secret", "keycloak_realm", "keycloak_url"]
+missing = [k for k in need if not d.get(k)]
+if missing:
+    print("missing keys: " + ",".join(missing))
+elif d["keycloak_url"] != "http://%s:30081" % os.environ["HUB_IP"]:
+    print("stale keycloak_url " + d["keycloak_url"])
+else:
+    print("OK " + d["keycloak_client_secret"])
+' 2>/dev/null || echo "unreadable")
+            if [ "${AUTH_CHECK%% *}" = "OK" ]; then
+                AF_VAULT_CS="${AUTH_CHECK#OK }"
+                ok "Vault secret/agentforge/auth present with all keys, keycloak_url current"
+            else
+                fail "Vault secret/agentforge/auth: $AUTH_CHECK — $AF_FIX"
+            fi
+        else
+            ok "Vault secret/agentforge/$P present"
+        fi
+    done
+fi
+
+# --- Keycloak: agentforge-gateway client, groups, user -------------------------
+KC_REPORT=$(docker exec "$HUB_CONTAINER" sh -c "
+    T=\$(curl -s --max-time 10 -X POST http://${HUB_IP}:30081/realms/master/protocol/openid-connect/token \
+        -d grant_type=password -d client_id=admin-cli \
+        -d username='${KEYCLOAK_ADMIN_USER:-admin}' -d password='${KEYCLOAK_ADMIN_PASS:-admin}' \
+        | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p')
+    K=http://${HUB_IP}:30081/admin/realms/helmsman
+    echo \"CLIENT \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients?clientId=agentforge-gateway\")\"
+    CID=\$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients?clientId=agentforge-gateway\" | sed -n 's/^\\[{\"id\":\"\\([^\"]*\\)\".*/\\1/p')
+    [ -n \"\$CID\" ] && echo \"SECRET \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients/\$CID/client-secret\")\"
+    echo \"GROUPS \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/groups\")\"
+    UID=\$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/users?exact=true&username=subhankar\" | sed -n 's/^\\[{\"id\":\"\\([^\"]*\\)\".*/\\1/p')
+    echo \"USER \$UID\"
+    [ -n \"\$UID\" ] && echo \"MEMBER \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/users/\$UID/groups\")\"
+" 2>/dev/null || echo "")
+KC_CS_LIVE=$(kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get secret agentforge-oauth2-proxy-secret \
+    -o jsonpath='{.data.client-secret}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+while IFS= read -r line; do
+    case "$line" in
+        OK*)   ok   "${line#OK }" ;;
+        WARN*) warn "${line#WARN } — $AF_FIX" ;;
+        *)     fail "${line#FAIL } — $AF_FIX" ;;
+    esac
+done < <(printf '%s\n' "$KC_REPORT" | VAULT_CS="$AF_VAULT_CS" K8S_CS="$KC_CS_LIVE" python3 -c '
+import json, os, sys
+r = {}
+for line in sys.stdin:
+    k, _, v = line.rstrip("\n").partition(" ")
+    r[k] = v
+def j(k):
+    try:
+        return json.loads(r.get(k) or "null")
+    except ValueError:
+        return None
+clients = j("CLIENT")
+if not isinstance(clients, list):
+    print("FAIL Keycloak admin API not reachable from hub (http://<hub-ip>:30081)"); sys.exit()
+if not clients:
+    print("FAIL Keycloak client agentforge-gateway missing")
+else:
+    c = clients[0]
+    print("OK Keycloak client agentforge-gateway present (confidential=%s)" % (not c.get("publicClient")))
+    if any(m.get("protocolMapper") == "oidc-group-membership-mapper" for m in c.get("protocolMappers", [])):
+        print("OK Keycloak client agentforge-gateway has groups mapper")
+    else:
+        print("FAIL Keycloak client agentforge-gateway has no groups mapper")
+    secret = (j("SECRET") or {}).get("value")
+    vcs, kcs = os.environ.get("VAULT_CS"), os.environ.get("K8S_CS")
+    if secret and secret == vcs == kcs:
+        print("OK client secret identical in Keycloak, Vault and the oauth2-proxy Secret")
+    else:
+        print("FAIL client secret mismatch (Keycloak=%s, Vault=%s, oauth2-proxy Secret=%s)" %
+              tuple("set" if x else "missing" for x in (secret, vcs, kcs)) if not (secret and vcs and kcs)
+              else "FAIL client secret differs between Keycloak, Vault and the oauth2-proxy Secret")
+names = {g["name"] for g in (j("GROUPS") or [])}
+for g in ("dev-team", "platform-team", "readonly"):
+    print(("OK Keycloak group %s present" if g in names else "FAIL Keycloak group %s missing") % g)
+if not r.get("USER"):
+    print("FAIL Keycloak user subhankar missing")
+else:
+    member = {g["name"] for g in (j("MEMBER") or [])}
+    print("OK Keycloak user subhankar is in dev-team" if "dev-team" in member
+          else "FAIL Keycloak user subhankar is not in dev-team")
+')
+
+# --- Kyverno, namespace, pull secret -------------------------------------------
+POLICY_READY=$(kubectl --context "$SPOKE_CONTEXT" get clusterpolicy verify-agentforge-signatures \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+[ "$POLICY_READY" = "True" ] && ok "Kyverno ClusterPolicy verify-agentforge-signatures Ready on spoke" || \
+    fail "Kyverno ClusterPolicy verify-agentforge-signatures not Ready on spoke (got: ${POLICY_READY:-<not found>})"
+
+NS_LABEL=$(kubectl --context "$SPOKE_CONTEXT" get namespace agentforge \
+    -o jsonpath='{.metadata.labels.helmsman\.dev/managed}' 2>/dev/null || echo "")
+[ "$NS_LABEL" = "true" ] && ok "Namespace agentforge labelled helmsman.dev/managed=true" || \
+    fail "Namespace agentforge missing label helmsman.dev/managed=true (got: ${NS_LABEL:-<none>})"
+
+GHCR_TYPE=$(kubectl --context "$SPOKE_CONTEXT" -n agentforge get secret ghcr-pull-secret \
+    -o jsonpath='{.type}' 2>/dev/null || echo "")
+[ "$GHCR_TYPE" = "kubernetes.io/dockerconfigjson" ] && ok "ghcr-pull-secret present in agentforge" || \
+    fail "ghcr-pull-secret missing in agentforge (got type: ${GHCR_TYPE:-<none>}) — $AF_FIX"
+
+# --- Backups that make the above survive a restart -----------------------------
+for B in vault-agentforge.json ghcr-pull-secret.json; do
+    if [ -s "$AF_STATE_DIR/$B" ]; then
+        ok "Backup $AF_STATE_DIR/$B present ($(date -r "$AF_STATE_DIR/$B" '+%Y-%m-%d %H:%M'))"
+    else
+        warn "Backup $AF_STATE_DIR/$B missing — a Docker restart now would lose this state for good; run dev-up-gemini.sh"
+    fi
+done
+
+info "Argo CD Application agentforge targets apps/agentforge/ — waiting for the AgentForge Helm chart"
 
 # =============================================================================
 header "Summary"
