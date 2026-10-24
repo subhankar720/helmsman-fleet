@@ -52,7 +52,7 @@ spec:
           image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
           args:
             - --provider=oidc
-            - --oidc-issuer-url=http://$(KEYCLOAK_URL)/realms/helmsman
+            - --oidc-issuer-url=$(KEYCLOAK_URL)/realms/helmsman   # keycloak-url already includes http:// (dev-up Stage 6)
             - --client-id=agentforge-gateway
             - --upstream=http://agentforge-gateway.agentforge.svc.cluster.local:8000
             - --http-address=0.0.0.0:4180
