@@ -153,6 +153,26 @@ for CONTAINER in "$HUB_CONTAINER" "$SPOKE_CONTAINER"; do
     esac
 done
 
+# Two Docker Desktop failure modes after a host reboot that keep a node down:
+# a lost endpoint on the kind network, and a host port taken by another
+# container that started first. dev-up-gemini.sh Stage 1 fixes the first and
+# names the culprit for the second.
+for CONTAINER in helmsman-hub-control-plane helmsman-hub-worker helmsman-hub-worker2 \
+                 helmsman-onprem-control-plane helmsman-onprem-worker; do
+    docker inspect "$CONTAINER" > /dev/null 2>&1 || continue
+    if [ "$(docker inspect "$CONTAINER" --format '{{len .NetworkSettings.Networks}}')" = "0" ]; then
+        fail "$CONTAINER has no endpoint on the kind network (boot fails: 'old IPv4 address but no current IPv4 address')"
+        CONTAINERS_DOWN=true
+    fi
+    for HOST_PORT in $(docker inspect "$CONTAINER" --format '{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}} {{end}}{{end}}'); do
+        OWNER=$(docker ps --format '{{.Names}}|{{.Ports}}' | grep -E ":${HOST_PORT}->" | cut -d'|' -f1 | grep -vx "$CONTAINER" | head -1)
+        if [ -n "$OWNER" ]; then
+            fail "Host port $HOST_PORT needed by $CONTAINER is published by $OWNER"
+            CONTAINERS_DOWN=true
+        fi
+    done
+done
+
 if [ "$CONTAINERS_DOWN" = true ]; then
     echo ""
     echo -e "$RECOVER_HINT"
@@ -1000,6 +1020,37 @@ else:
     print("OK Keycloak user subhankar is in dev-team" if "dev-team" in member
           else "FAIL Keycloak user subhankar is not in dev-team")
 ')
+
+# --- Platform namespaces must stay out of the Kyverno app policies ------------
+for NS in helmsman-operator-system envoy-gateway-system gateway-infra monitoring kyverno external-secrets; do
+    if [ "$(kubectl --context "$SPOKE_CONTEXT" get namespace "$NS" \
+        -o jsonpath='{.metadata.labels.helmsman\.dev/managed}' 2>/dev/null)" = "true" ]; then
+        fail "Platform namespace $NS is labelled helmsman.dev/managed=true — Kyverno app policies will block its next pod (dev-up-gemini.sh Stage 8 removes it)"
+    fi
+done
+# Events linger ~1h, so only report owners that are still short of pods.
+BLOCKED=""
+while read -r NS KIND NAME; do
+    [ -z "$NAME" ] && continue
+    case "$KIND" in
+        ReplicaSet)  SHORT=$(kubectl --context "$SPOKE_CONTEXT" -n "$NS" get rs "$NAME" \
+                       -o jsonpath='{.spec.replicas} {.status.replicas}' 2>/dev/null) ;;
+        DaemonSet)   SHORT=$(kubectl --context "$SPOKE_CONTEXT" -n "$NS" get ds "$NAME" \
+                       -o jsonpath='{.status.desiredNumberScheduled} {.status.currentNumberScheduled}' 2>/dev/null) ;;
+        StatefulSet) SHORT=$(kubectl --context "$SPOKE_CONTEXT" -n "$NS" get sts "$NAME" \
+                       -o jsonpath='{.spec.replicas} {.status.replicas}' 2>/dev/null) ;;
+        *)           SHORT="" ;;
+    esac
+    read -r WANT HAVE <<< "$SHORT"
+    [ "${WANT:-0}" -gt "${HAVE:-0}" ] 2>/dev/null && BLOCKED="$BLOCKED $NS/$KIND/$NAME"
+done < <(kubectl --context "$SPOKE_CONTEXT" get events -A --field-selector reason=FailedCreate \
+    -o jsonpath='{range .items[*]}{.involvedObject.namespace} {.involvedObject.kind} {.involvedObject.name} {.message}{"\n"}{end}' 2>/dev/null \
+    | grep -i kyverno | awk '{print $1, $2, $3}' | sort -u)
+if [ -z "$BLOCKED" ]; then
+    ok "No workloads currently blocked by Kyverno admission on spoke"
+else
+    for B in $BLOCKED; do fail "Kyverno is blocking pod creation for $B"; done
+fi
 
 # --- Kyverno, namespace, pull secret -------------------------------------------
 POLICY_READY=$(kubectl --context "$SPOKE_CONTEXT" get clusterpolicy verify-agentforge-signatures \

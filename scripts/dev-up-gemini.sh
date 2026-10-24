@@ -75,6 +75,11 @@ ARGOCD_MANAGER_SA="argocd-manager"
 OPERATOR_DEPLOY="helmsman-operator-controller-manager"
 OPERATOR_NS="helmsman-operator-system"
 
+# Spoke namespaces that hold platform components, never app workloads. They
+# still get helmsman-platform-config (Stage 6) but must NOT be opted into the
+# Kyverno app policies (Stage 8).
+PLATFORM_NAMESPACES_RE="^(helmsman-operator-system|envoy-gateway-system|gateway-infra|monitoring|kyverno|external-secrets)$"
+
 # Durable state that must outlive the clusters. Vault runs in -dev mode
 # (in-memory) and Keycloak has no PVC, so anything written to them at runtime
 # is gone after a Docker restart — Stage 10.5 restores it from here.
@@ -389,16 +394,63 @@ ALL_CONTAINERS=(
   "${SPOKE_CLUSTER_NAME}-worker"
 )
 
+# After a host reboot Docker Desktop can break a kind node in two ways:
+#  - drop its endpoint on the `kind` network (NetworkMode is still "kind" but
+#    Networks is empty). kind's entrypoint then exits at boot with
+#    "have an old IPv4 address but no current IPv4 address (!)".
+#  - refuse to start it because another container that came up first now owns
+#    one of its published host ports (hub control-plane: 8080 → NodePort 30080).
+# A failed start also rolls back a fresh `docker network connect`, so check
+# the endpoint before every attempt and confirm the node really booted.
+container_ip() {
+  docker inspect "$1" --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo ""
+}
+
+start_kind_container() {
+  local c=$1 attempt err port owner
+  for attempt in 1 2; do
+    if [ "$(docker inspect "$c" --format '{{len .NetworkSettings.Networks}}' 2>/dev/null)" = "0" ]; then
+      log_warn "$c lost its endpoint on the kind network — reconnecting"
+      docker network connect kind "$c" > /dev/null 2>&1 || true
+    fi
+    if ! err=$(docker start "$c" 2>&1 > /dev/null); then
+      port=$(echo "$err" | sed -n 's/.*Bind for [^ ]*:\([0-9][0-9]*\) failed.*/\1/p')
+      if [ -n "$port" ]; then
+        owner=$(docker ps --format '{{.Names}}|{{.Ports}}' | grep -E ":${port}->" | cut -d'|' -f1 | head -1)
+        log_error "$c cannot start: host port $port is already in use by ${owner:-a process outside Docker}"
+        log_error "  Free it (e.g. 'docker stop ${owner:-<container>}', or move that app to another port) and re-run."
+      else
+        log_error "$c failed to start: $err"
+      fi
+      return 1
+    fi
+    # kind's entrypoint exits within seconds if it has no IP; wait to be sure
+    for i in {1..10}; do
+      [ "$(docker inspect "$c" --format '{{.State.Status}}' 2>/dev/null)" = "running" ] && \
+        [ -n "$(container_ip "$c")" ] && return 0
+      sleep 2
+    done
+    log_warn "$c exited during boot: $(docker logs --tail 1 "$c" 2>&1)"
+  done
+  log_error "$c did not come up — check: docker logs $c"
+  return 1
+}
+
 CONTAINERS_STARTED=false
+CONTAINERS_FAILED=false
 for CONTAINER in "${ALL_CONTAINERS[@]}"; do
   STATUS=$(docker inspect "$CONTAINER" --format='{{.State.Status}}' 2>/dev/null || echo "not_found")
-  CONTAINER_IP=$(docker inspect "$CONTAINER" \
-    --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
+  CONTAINER_IP=$(container_ip "$CONTAINER")
   case "$STATUS" in
     running)
       if [ -z "$CONTAINER_IP" ] || [ "$CONTAINER_IP" = "invalid IP" ]; then
         log_warn "$CONTAINER has no IP — restarting..."
-        docker restart "$CONTAINER" > /dev/null 2>&1 || true
+        docker stop "$CONTAINER" > /dev/null 2>&1 || true
+        if start_kind_container "$CONTAINER"; then
+          log_ok "$CONTAINER restarted ($(container_ip "$CONTAINER"))"
+        else
+          CONTAINERS_FAILED=true
+        fi
         CONTAINERS_STARTED=true
       else
         log_ok "$CONTAINER running ($CONTAINER_IP)"
@@ -406,7 +458,11 @@ for CONTAINER in "${ALL_CONTAINERS[@]}"; do
       ;;
     exited|stopped|created)
       log_warn "$CONTAINER is stopped — starting..."
-      docker start "$CONTAINER" > /dev/null 2>&1 || true
+      if start_kind_container "$CONTAINER"; then
+        log_ok "$CONTAINER started ($(container_ip "$CONTAINER"))"
+      else
+        CONTAINERS_FAILED=true
+      fi
       CONTAINERS_STARTED=true
       ;;
     not_found)
@@ -415,6 +471,26 @@ for CONTAINER in "${ALL_CONTAINERS[@]}"; do
       ;;
   esac
 done
+
+if $CONTAINERS_FAILED; then
+  log_error "Not all Kind node containers are running — fix the errors above and re-run."
+  exit 1
+fi
+
+# Docker Desktop restarts kind nodes on its own after a reboot (restart
+# policy), so "this run started them" misses most real restarts. Any node that
+# (re)started after the last successful dev-up run needs the same recovery.
+LAST_RUN_FILE="$HELMSMAN_STATE_DIR/last-dev-up"
+if ! $CONTAINERS_STARTED; then
+  LAST_RUN=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo 0)
+  for CONTAINER in "${ALL_CONTAINERS[@]}"; do
+    STARTED_AT=$(date -d "$(docker inspect "$CONTAINER" --format '{{.State.StartedAt}}')" +%s 2>/dev/null || echo 0)
+    if [ "$STARTED_AT" -gt "$LAST_RUN" ]; then
+      log_info "$CONTAINER restarted since the last dev-up run — treating as a Docker restart"
+      CONTAINERS_STARTED=true
+    fi
+  done
+fi
 
 if $CONTAINERS_STARTED; then
   log_info "Containers started — waiting 25s for API servers..."
@@ -815,11 +891,24 @@ log_warn "NOTE: keep this manifest's HUB_IP/SPOKE_IP in sync with platform/obser
 # =============================================================================
 log_step "Stage 8: Kyverno Namespace Labels"
 
+# helmsman.dev/managed=true opts a namespace into the Kyverno app policies
+# (managed-by label, non-root, limits, signed images). Platform components
+# don't meet them — Promtail runs as root on hostNetwork, the operator and
+# Envoy Gateway pods lack app labels — so labelling their namespaces makes
+# Kyverno reject their next pod (seen: helmsman-operator rollout stuck).
 for NS in $APP_NAMESPACES; do
-  kubectl --context "$SPOKE_CTX" label namespace "$NS" \
-    helmsman.dev/managed=true \
-    --overwrite > /dev/null 2>&1 || true
-  log_ok "Kyverno label applied: $NS"
+  if echo "$NS" | grep -qE "$PLATFORM_NAMESPACES_RE"; then
+    if [ -n "$(kubectl --context "$SPOKE_CTX" get namespace "$NS" \
+        -o jsonpath='{.metadata.labels.helmsman\.dev/managed}' 2>/dev/null)" ]; then
+      kubectl --context "$SPOKE_CTX" label namespace "$NS" helmsman.dev/managed- > /dev/null 2>&1 || true
+      log_ok "Kyverno label removed from platform namespace: $NS"
+    fi
+  else
+    kubectl --context "$SPOKE_CTX" label namespace "$NS" \
+      helmsman.dev/managed=true \
+      --overwrite > /dev/null 2>&1 || true
+    log_ok "Kyverno label applied: $NS"
+  fi
 done
 
 # =============================================================================
@@ -1490,6 +1579,7 @@ else
 fi
 
 if $SANITY_PASS; then
+  mkdir -p "$HELMSMAN_STATE_DIR" && date +%s > "$LAST_RUN_FILE"
   echo -e "\n${BOLD}${GREEN}========================================${NC}"
   echo -e "${BOLD}${GREEN}  BOOTSTRAP COMPLETED SUCCESSFULLY      ${NC}"
   echo -e "${BOLD}${GREEN}========================================${NC}"
