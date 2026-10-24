@@ -849,12 +849,19 @@ else
     fail "Gateway proxy Service type is '${GW_SVC_TYPE:-<not found>}', expected NodePort — check EnvoyProxy gateway-infra/helmsman-proxy"
 fi
 
-ROUTE_STATUS=$(kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get httproute agentforge-gateway-route \
+# The route is owned by the AgentForge chart (agentforge namespace); its "/"
+# backend is oauth2-proxy in gateway-infra, allowed by a ReferenceGrant there.
+if kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get referencegrant agentforge-to-oauth2-proxy > /dev/null 2>&1; then
+    ok "ReferenceGrant gateway-infra/agentforge-to-oauth2-proxy present"
+else
+    fail "ReferenceGrant gateway-infra/agentforge-to-oauth2-proxy missing — the AgentForge route can't reach oauth2-proxy"
+fi
+ROUTE_STATUS=$(kubectl --context "$SPOKE_CONTEXT" -n agentforge get httproute agentforge \
     -o jsonpath='{range .status.parents[0].conditions[*]}{.type}={.status} {end}' 2>/dev/null || echo "")
 if echo "$ROUTE_STATUS" | grep -q "Accepted=True" && echo "$ROUTE_STATUS" | grep -q "ResolvedRefs=True"; then
-    ok "HTTPRoute agentforge-gateway-route Accepted, backend resolved"
+    ok "HTTPRoute agentforge/agentforge Accepted, backends resolved"
 else
-    fail "HTTPRoute agentforge-gateway-route not healthy (${ROUTE_STATUS:-not found})"
+    fail "HTTPRoute agentforge/agentforge not healthy (${ROUTE_STATUS:-not found}) — synced by the agentforge Application"
 fi
 
 # --- oauth2-proxy -------------------------------------------------------------
@@ -1077,7 +1084,31 @@ for B in vault-agentforge.json ghcr-pull-secret.json; do
     fi
 done
 
-info "Argo CD Application agentforge targets apps/agentforge/ — waiting for the AgentForge Helm chart"
+# --- AgentForge workloads (apps/agentforge chart) ------------------------------
+KY_GHCR=$(kubectl --context "$SPOKE_CONTEXT" -n kyverno get secret ghcr-pull-secret -o jsonpath='{.type}' 2>/dev/null || echo "")
+[ "$KY_GHCR" = "kubernetes.io/dockerconfigjson" ] && ok "ghcr-pull-secret present in kyverno (image signature checks can authenticate)" || \
+    fail "ghcr-pull-secret missing in kyverno namespace — verify-agentforge-signatures can't read private images; $AF_FIX"
+
+AF_ES=$(kubectl --context "$SPOKE_CONTEXT" -n agentforge get externalsecret agentforge-secrets \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+[ "$AF_ES" = "True" ] && ok "ExternalSecret agentforge/agentforge-secrets Ready" || \
+    fail "ExternalSecret agentforge/agentforge-secrets not Ready (${AF_ES:-not found}) — check its Vault keys; $AF_FIX"
+
+for W in statefulset/agentforge-postgres statefulset/agentforge-redis deployment/agentforge-flower \
+         deployment/agentforge-gateway deployment/agentforge-worker; do
+    WANT=$(kubectl --context "$SPOKE_CONTEXT" -n agentforge get "$W" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "")
+    HAVE=$(kubectl --context "$SPOKE_CONTEXT" -n agentforge get "$W" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "")
+    if [ -z "$WANT" ]; then
+        REASON=$(kubectl --context "$HUB_CONTEXT" -n argocd get application agentforge \
+            -o jsonpath='{.status.operationState.syncResult.resources[?(@.name=="'"${W#*/}"'")].message}' 2>/dev/null \
+            | grep -o "failed to verify image[^']*" | head -1 | cut -c1-160)
+        fail "AgentForge ${W#*/} not deployed${REASON:+ — Kyverno: $REASON}"
+    elif [ "${HAVE:-0}" -ge "$WANT" ] 2>/dev/null; then
+        ok "AgentForge ${W#*/} ready (${HAVE}/${WANT})"
+    else
+        fail "AgentForge ${W#*/} not ready (${HAVE:-0}/${WANT})"
+    fi
+done
 
 # =============================================================================
 header "Summary"

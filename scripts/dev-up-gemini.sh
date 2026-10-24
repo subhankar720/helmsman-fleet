@@ -1125,6 +1125,16 @@ else
   log_warn "  kubectl --context $SPOKE_CTX -n agentforge create secret docker-registry ghcr-pull-secret --docker-server=ghcr.io --docker-username=<user> --docker-password=<PAT>"
 fi
 
+# Kyverno's verify-agentforge-signatures reads the private image and its
+# signature with this secret, from its own namespace.
+if [ -s "$AF_GHCR_BACKUP" ]; then
+  kubectl --context "$SPOKE_CTX" -n kyverno create secret generic ghcr-pull-secret \
+    --type=kubernetes.io/dockerconfigjson --from-file=.dockerconfigjson="$AF_GHCR_BACKUP" \
+    --dry-run=client -o yaml | kubectl --context "$SPOKE_CTX" apply -f - > /dev/null 2>&1 && \
+    log_ok "ghcr-pull-secret mirrored to kyverno namespace (image signature checks)" || \
+    log_warn "Could not mirror ghcr-pull-secret to kyverno namespace"
+fi
+
 # --- Vault: secret/agentforge/* ------------------------------------------------
 # Live Vault wins (so values the AgentForge team writes are kept and backed
 # up); the backup only fills paths Vault lost. auth.keycloak_url always tracks
@@ -1147,6 +1157,21 @@ paths = os.environ["AF_VAULT_PATHS"].split()
 backup_file = os.environ["AF_VAULT_BACKUP"]
 keycloak_url = "http://%s:30081" % os.environ["HUB_IP"]
 PLACEHOLDER = {"placeholder": "AgentForge team must populate this path"}
+
+# Keys the AgentForge chart's ExternalSecret (apps/agentforge/templates/
+# external-secret.yaml) reads. ESO syncs all-or-nothing, so a missing key
+# leaves agentforge-secrets uncreated and Postgres/Flower can't start.
+# db/cache point at the chart's own in-cluster Postgres/Redis, so the platform
+# generates them; llm/confluence are the AgentForge team's credentials and
+# start empty. Existing values are never overwritten.
+PG_PASSWORD = secrets.token_urlsafe(18)
+REQUIRED = {
+    "llm":        {"groq_api_key": ""},
+    "db":         {"postgres_password": PG_PASSWORD,
+                   "database_url": "postgresql://agentforge:%s@agentforge-postgres.agentforge.svc.cluster.local:5432/agentforge" % PG_PASSWORD},
+    "cache":      {"redis_url": "redis://agentforge-redis.agentforge.svc.cluster.local:6379/0"},
+    "confluence": {"confluence_url": "", "confluence_email": "", "confluence_api_token": ""},
+}
 
 def vault(*args, stdin=None):
     return subprocess.run(
@@ -1179,6 +1204,17 @@ for p in paths:
         if not data.get("cookie_secret"):
             data["cookie_secret"] = secrets.token_urlsafe(24)   # 32 chars, valid for oauth2-proxy
             print("WARN: auth.cookie_secret generated (no live value or backup)")
+    added = []
+    req = REQUIRED.get(p, {})
+    if p == "db" and "postgres_password" in data and "database_url" not in data:
+        # keep the URL consistent with an existing password
+        req = dict(req, database_url=req["database_url"].replace(PG_PASSWORD, data["postgres_password"]))
+    for k, v in req.items():
+        if k not in data:
+            data[k] = v
+            added.append(k)
+    if added:
+        print("OK: secret/agentforge/%s: added %s" % (p, ", ".join(added)))
     desired[p] = data
     if data == live:
         print("OK: secret/agentforge/%s present" % p)
@@ -1188,7 +1224,7 @@ for p in paths:
         failed = True
         print("ERR: writing secret/agentforge/%s failed: %s" % (p, r.stderr.strip()))
     elif source == "live":
-        print("OK: secret/agentforge/%s updated (keycloak_url -> %s)" % (p, keycloak_url))
+        print("OK: secret/agentforge/%s updated" % p)
     elif source == "backup":
         print("OK: secret/agentforge/%s was missing — restored from backup" % p)
     else:
@@ -1487,7 +1523,34 @@ else
   log_error "No Envoy proxy Service found for helmsman-gateway"
 fi
 
-log_info "Argo CD Application agentforge waits for the AgentForge Helm chart in apps/agentforge/"
+# --- AgentForge workloads (apps/agentforge chart) ------------------------------
+kubectl --context "$SPOKE_CTX" -n agentforge annotate externalsecret agentforge-secrets \
+  force-sync="$(date +%s)" --overwrite > /dev/null 2>&1 || true
+AF_ES_READY=""
+for i in {1..10}; do
+  AF_ES_READY=$(kubectl --context "$SPOKE_CTX" -n agentforge get externalsecret agentforge-secrets \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+  [ "$AF_ES_READY" = "True" ] && break
+  sleep 3
+done
+[ "$AF_ES_READY" = "True" ] && log_ok "ExternalSecret agentforge/agentforge-secrets synced from Vault" || \
+  log_warn "ExternalSecret agentforge/agentforge-secrets not Ready (${AF_ES_READY:-not found})"
+for W in statefulset/agentforge-postgres statefulset/agentforge-redis deployment/agentforge-flower \
+         deployment/agentforge-gateway deployment/agentforge-worker; do
+  WANT=$(kubectl --context "$SPOKE_CTX" -n agentforge get "$W" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "")
+  HAVE=$(kubectl --context "$SPOKE_CTX" -n agentforge get "$W" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "")
+  if [ -z "$WANT" ]; then
+    # Kyverno rejects the Deployment itself when the image can't be verified
+    REASON=$(kubectl --context "$HUB_CTX" -n argocd get application agentforge \
+      -o jsonpath='{.status.operationState.syncResult.resources[?(@.name=="'"${W#*/}"'")].message}' 2>/dev/null \
+      | grep -o "failed to verify image[^']*" | head -1 | cut -c1-160)
+    log_warn "AgentForge ${W#*/} not deployed${REASON:+ — Kyverno: $REASON}"
+  elif [ "${HAVE:-0}" -ge "$WANT" ] 2>/dev/null; then
+    log_ok "AgentForge ${W#*/} ready (${HAVE}/${WANT})"
+  else
+    log_warn "AgentForge ${W#*/} not ready (${HAVE:-0}/${WANT})"
+  fi
+done
 
 # =============================================================================
 # Stage 11: Health Verification

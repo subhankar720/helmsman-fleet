@@ -21,6 +21,12 @@ spec:
       verifyImages:
         - imageReferences:
             - "ghcr.io/subhankar720/agentforge*"
+          # The repo is private: Kyverno must authenticate to read the image and
+          # its signature. Secret lives in the kyverno namespace (dev-up Stage
+          # 10.5 copies it from ghcr-pull-secret / ~/.helmsman-dev backup).
+          imageRegistryCredentials:
+            secrets:
+              - ghcr-pull-secret
           attestors:
             - count: 1
               entries:

@@ -9,8 +9,12 @@ spec:
     repoURL: https://github.com/subhankar720/helmsman-fleet.git
     targetRevision: main
     path: apps/agentforge
-    directory:
-      exclude: "argocd-application.yaml"
+    # apps/agentforge is the AgentForge Helm chart (Chart.yaml); render it
+    # with the Helmsman kind-cluster overrides
+    helm:
+      releaseName: agentforge
+      valueFiles:
+        - values-helmsman-onprem.yaml
   destination:
     name: helmsman-onprem
     namespace: agentforge
