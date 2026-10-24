@@ -1,0 +1,15 @@
+# ── Helmsman kind cluster overrides ──────────────────────────────────────────
+
+auth:
+  enabled: true
+
+config:
+  modelBackend: cloud_free
+  env: staging
+  authEnabled: "true"
+  hitlAutoApprove: "false"
+
+# Prometheus and the ServiceMonitor CRD live on the Hub cluster; a ServiceMonitor
+# created on the spoke is never scraped. Re-enable once cross-cluster scraping exists.
+serviceMonitor:
+  enabled: false

@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: agentforge-postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+spec:
+  serviceName: agentforge-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentforge-postgres
+  template:
+    metadata:
+      labels:
+        {{- include "agentforge.labels" . | nindent 8 }}
+        app.kubernetes.io/name: agentforge-postgres
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      # fsGroup ensures the PVC is owned by the postgres user (999) on mount.
+      # This replaces the previous root initContainer chown approach,
+      # which was blocked by the Kyverno require-non-root ClusterPolicy.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999      # postgres official image user
+        fsGroup: 999        # PVC mounted with group 999 — postgres can write
+      imagePullSecrets:
+        {{- toYaml .Values.imagePullSecrets | nindent 8 }}
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image }}
+          securityContext:
+            {{- include "agentforge.containerSecurityContext" . | nindent 12 }}
+          env:
+            - name: POSTGRES_DB
+              value: {{ .Values.postgres.database }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgres.user }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: agentforge-secrets
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+              name: postgres
+          resources:
+            {{- toYaml .Values.postgres.resources | nindent 12 }}
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.postgres.user | quote }}]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.postgres.user | quote }}]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: postgres-init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        - name: postgres-init
+          configMap:
+            name: agentforge-postgres-init
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ .Values.postgres.storageClass }}
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage }}

@@ -1,0 +1,152 @@
+# ── AgentForge Helm Chart Values ─────────────────────────────────────────────
+# These are the defaults. Override in values-helmsman-onprem.yaml
+
+image:
+  repository: ghcr.io/subhankar720/agentforge
+  tag: latest
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: ghcr-pull-secret
+
+serviceAccount:
+  name: agentforge
+
+# ── Gateway (FastAPI) ─────────────────────────────────────────────────────────
+gateway:
+  replicas: 1
+  command:
+    - uvicorn
+    - gateway.api.main:app
+    - --host=0.0.0.0
+    - --port=8000
+    - --workers=1
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "1"
+      memory: "512Mi"
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 8000
+    initialDelaySeconds: 15
+    periodSeconds: 20
+  readinessProbe:
+    httpGet:
+      path: /health/ready
+      port: 8000
+    initialDelaySeconds: 10
+    periodSeconds: 10
+
+# ── Celery Worker ─────────────────────────────────────────────────────────────
+worker:
+  replicas: 1
+  command:
+    - celery
+    - -A=gateway.orchestrator.celery_app
+    - worker
+    - --queues=sdlc,default
+    - --concurrency=2
+    - --loglevel=info
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "1"
+      memory: "1Gi"
+
+# ── Redis ─────────────────────────────────────────────────────────────────────
+redis:
+  image: redis:7-alpine
+  storage: 1Gi
+  storageClass: standard
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "200m"
+      memory: "256Mi"
+
+# ── Postgres ──────────────────────────────────────────────────────────────────
+postgres:
+  image: pgvector/pgvector:pg16
+  storage: 5Gi
+  storageClass: standard
+  database: agentforge
+  user: agentforge
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+# ── Flower (Celery UI) ────────────────────────────────────────────────────────
+flower:
+  enabled: true
+  image: mher/flower:2.0
+  resources:
+    requests:
+      cpu: "50m"
+      memory: "64Mi"
+    limits:
+      cpu: "100m"
+      memory: "128Mi"
+
+# ── Networking ────────────────────────────────────────────────────────────────
+httproute:
+  enabled: true
+  host: agentforge.helmsman.local
+  gateway:
+    name: helmsman-gateway
+    namespace: gateway-infra
+  # Authenticated traffic routes through the Helmsman-managed oauth2-proxy in
+  # gateway-infra (a ReferenceGrant there permits the cross-namespace backend).
+  # oauth2-proxy injects X-Auth-Request-User / -Email / -Groups headers.
+  # Team id: request.headers.get("X-Auth-Request-Groups", "").split(",")[0]
+  oauth2Proxy:
+    name: agentforge-oauth2-proxy
+    namespace: gateway-infra
+    port: 4180
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+auth:
+  enabled: false          # true in values-helmsman-onprem.yaml
+
+# ── Non-secret config ─────────────────────────────────────────────────────────
+config:
+  modelBackend: cloud_free
+  env: staging
+  logLevel: INFO
+  authEnabled: "false"
+  hitlAutoApprove: "false"
+  ollamaBaseUrl: http://host.docker.internal:11434/v1
+  confluenceSpaceKey: "~712020e0e86f151c104276b5ec2e685ae3b22e"
+  confluenceAncestorId: "589825"
+
+# ── External Secrets ──────────────────────────────────────────────────────────
+externalSecrets:
+  enabled: true
+  secretStoreName: vault-backend
+  secretStoreKind: ClusterSecretStore
+  refreshInterval: 1h
+
+# ── Observability ─────────────────────────────────────────────────────────────
+serviceMonitor:
+  enabled: true
+  labels:
+    release: platform-prometheus-stack
+  interval: 30s
+
+grafanaDashboard:
+  enabled: true
+
+# ── Network Policies ──────────────────────────────────────────────────────────
+networkPolicies:
+  enabled: true

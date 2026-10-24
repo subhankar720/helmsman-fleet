@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentforge-postgres-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+data:
+  init.sql: |
+    -- AgentForge Postgres Initialisation Script
+    -- Runs automatically on first container start via /docker-entrypoint-initdb.d/
+
+    CREATE EXTENSION IF NOT EXISTS vector;
+    CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+    -- Audit trail for all agent runs
+    CREATE TABLE IF NOT EXISTS agent_runs (
+        run_id       VARCHAR(36) PRIMARY KEY,
+        task_id      VARCHAR(36),
+        agent_id     VARCHAR(100) NOT NULL,
+        team_id      VARCHAR(100) NOT NULL,
+        status       VARCHAR(50)  NOT NULL,
+        input        TEXT,
+        output       TEXT,
+        tokens_used  INTEGER      DEFAULT 0,
+        cost_usd     DECIMAL(10,6) DEFAULT 0.0,
+        duration_ms  INTEGER      DEFAULT 0,
+        error        TEXT,
+        created_at   TIMESTAMPTZ  DEFAULT NOW(),
+        completed_at TIMESTAMPTZ
+    );
+
+    -- IntelliSearch knowledge base
+    CREATE TABLE IF NOT EXISTS document_chunks (
+        chunk_id     VARCHAR(32)  PRIMARY KEY,
+        source_type  VARCHAR(50)  NOT NULL,
+        source_title TEXT         NOT NULL,
+        source_url   TEXT         NOT NULL,
+        author       VARCHAR(100) DEFAULT 'system',
+        access_level VARCHAR(50)  DEFAULT 'team',
+        content      TEXT         NOT NULL,
+        indexed_at   TIMESTAMPTZ  DEFAULT NOW()
+    );
+
+    -- Full-text search index (Phase 6)
+    CREATE INDEX IF NOT EXISTS idx_document_chunks_fts
+        ON document_chunks USING GIN(to_tsvector('english', content));
+
+    -- pgvector index (Phase 7 — column added when embedding enabled)
+    -- ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding vector(768);
+    -- CREATE INDEX IF NOT EXISTS idx_document_chunks_vec
+    --     ON document_chunks USING ivfflat (embedding vector_cosine_ops);
+
+    CREATE INDEX IF NOT EXISTS idx_agent_runs_team_id   ON agent_runs(team_id);
+    CREATE INDEX IF NOT EXISTS idx_agent_runs_created   ON agent_runs(created_at);
+    CREATE INDEX IF NOT EXISTS idx_agent_runs_agent_id  ON agent_runs(agent_id);

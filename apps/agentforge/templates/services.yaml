@@ -1,0 +1,72 @@
+# Gateway Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentforge-gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+    app.kubernetes.io/name: agentforge-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: agentforge-gateway
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+# Redis Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentforge-redis
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None    # headless — StatefulSet uses DNS
+  selector:
+    app.kubernetes.io/name: agentforge-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+# Postgres Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentforge-postgres
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None    # headless — StatefulSet uses DNS
+  selector:
+    app.kubernetes.io/name: agentforge-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+# Flower Service
+{{- if .Values.flower.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentforge-flower
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: agentforge-flower
+  ports:
+    - name: http
+      port: 5555
+      targetPort: http
+{{- end }}

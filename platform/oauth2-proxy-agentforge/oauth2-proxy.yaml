@@ -1,6 +1,5 @@
 ---
-# ExternalSecret — syncs oauth2-proxy credentials from Vault
-# cookie_secret and keycloak client credentials live in Vault agentforge/auth
+# ExternalSecret — syncs oauth2-proxy credentials from Vault (agentforge/auth)
 apiVersion: external-secrets.io/v1beta1
 kind: ExternalSecret
 metadata:
@@ -24,9 +23,8 @@ spec:
         key: agentforge/auth
         property: cookie_secret
 ---
-# oauth2-proxy Deployment
-# Validates Keycloak JWTs, injects X-Auth-Request-* headers,
-# proxies authenticated requests to the AgentForge gateway service.
+# oauth2-proxy Deployment — validates Keycloak JWTs, injects X-Auth-Request-*
+# headers, proxies authenticated requests to the AgentForge gateway service.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -53,26 +51,19 @@ spec:
         - name: oauth2-proxy
           image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
           args:
-            # OIDC provider — Keycloak helmsman realm
             - --provider=oidc
-            - --oidc-issuer-url=$(KEYCLOAK_URL)/realms/helmsman   # keycloak-url already includes http://
+            - --oidc-issuer-url=http://$(KEYCLOAK_URL)/realms/helmsman
             - --client-id=agentforge-gateway
-            # Upstream — AgentForge gateway service in agentforge namespace
-            # Cross-namespace: use FQDN
             - --upstream=http://agentforge-gateway.agentforge.svc.cluster.local:8000
             - --http-address=0.0.0.0:4180
-            # Auth settings
             - --email-domain=*
             - --scope=openid profile email
-            # Header injection — AgentForge reads these
             - --set-xauthrequest=true
             - --pass-access-token=true
             - --pass-user-headers=true
-            # Skip auth for health and metrics endpoints
             - --skip-auth-route=^/health
             - --skip-auth-route=^/metrics
-            # Cookie settings
-            - --cookie-secure=false   # HTTP only for local dev — set true in prod
+            - --cookie-secure=false   # HTTP only for local dev — true in prod
             - --cookie-name=_helmsman_auth
           env:
             - name: KEYCLOAK_URL
@@ -118,7 +109,6 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
 ---
-# Service — Envoy Gateway routes to this
 apiVersion: v1
 kind: Service
 metadata:
@@ -135,28 +125,23 @@ spec:
       port: 4180
       targetPort: http
 ---
-# HTTPRoute — routes agentforge.helmsman.local through oauth2-proxy
-# AgentForge team attaches their own HTTPRoute once their service is deployed
-# This route is the platform-level entry point owned by Helmsman
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
+# ReferenceGrant — lets AgentForge's HTTPRoute (agentforge namespace) use
+# agentforge-oauth2-proxy (gateway-infra) as a cross-namespace backend.
+# NOTE: the old Helmsman-owned HTTPRoute "agentforge-gateway-route" was removed;
+# AgentForge's chart now owns the route for agentforge.helmsman.local.
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
 metadata:
-  name: agentforge-gateway-route
+  name: agentforge-to-oauth2-proxy
   namespace: gateway-infra
   labels:
     app.kubernetes.io/managed-by: helmsman
 spec:
-  parentRefs:
-    - name: helmsman-gateway
-      namespace: gateway-infra
-  hostnames:
-    - agentforge.helmsman.local
-  rules:
-    - matches:
-        - path:
-            type: PathPrefix
-            value: /
-      backendRefs:
-        - name: agentforge-oauth2-proxy
-          namespace: gateway-infra
-          port: 4180
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: agentforge
+  to:
+    - group: ""
+      kind: Service
+      name: agentforge-oauth2-proxy

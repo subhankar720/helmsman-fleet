@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentforge-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+data:
+  AGENTFORGE_MODEL_BACKEND: {{ .Values.config.modelBackend | quote }}
+  AGENTFORGE_ENV:           {{ .Values.config.env | quote }}
+  AGENTFORGE_LOG_LEVEL:     {{ .Values.config.logLevel | quote }}
+  AGENTFORGE_AUTH_ENABLED:  {{ .Values.config.authEnabled | quote }}
+  HITL_AUTO_APPROVE:        {{ .Values.config.hitlAutoApprove | quote }}
+  OLLAMA_BASE_URL:          {{ .Values.config.ollamaBaseUrl | quote }}
+  CONFLUENCE_SPACE_KEY:     {{ .Values.config.confluenceSpaceKey | quote }}
+  CONFLUENCE_ANCESTOR_ID:   {{ .Values.config.confluenceAncestorId | quote }}

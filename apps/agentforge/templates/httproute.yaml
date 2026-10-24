@@ -1,0 +1,45 @@
+{{- if .Values.httproute.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: agentforge
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .Values.httproute.gateway.name }}
+      namespace: {{ .Values.httproute.gateway.namespace }}
+  hostnames:
+    - {{ .Values.httproute.host | quote }}
+  rules:
+    # Health and metrics bypass auth — probe traffic goes direct to gateway
+    # These paths are also configured as --skip-auth-route in oauth2-proxy
+    - matches:
+        - path:
+            type: Exact
+            value: /health
+        - path:
+            type: Exact
+            value: /health/ready
+        - path:
+            type: Exact
+            value: /metrics
+      backendRefs:
+        - name: agentforge-gateway
+          namespace: {{ .Release.Namespace }}
+          port: 8000
+
+    # All authenticated traffic routes through the Helmsman oauth2-proxy.
+    # oauth2-proxy validates the Keycloak JWT, injects X-Auth-Request-* headers,
+    # then proxies to agentforge-gateway.agentforge.svc.cluster.local:8000.
+    # A ReferenceGrant in gateway-infra permits this cross-namespace reference.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: {{ .Values.httproute.oauth2Proxy.name }}
+          namespace: {{ .Values.httproute.oauth2Proxy.namespace }}
+          port: {{ .Values.httproute.oauth2Proxy.port }}
+{{- end }}
