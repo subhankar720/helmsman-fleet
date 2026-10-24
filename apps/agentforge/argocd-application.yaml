@@ -3,6 +3,10 @@ kind: Application
 metadata:
   name: agentforge
   namespace: argocd
+  annotations:
+    # server-defaulted fields (StatefulSet, ExternalSecret, HTTPRoute) would
+    # otherwise show as permanent drift in a client-side diff
+    argocd.argoproj.io/compare-options: ServerSideDiff=true
 spec:
   project: default
   source:
