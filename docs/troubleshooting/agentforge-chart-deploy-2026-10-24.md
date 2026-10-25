@@ -2,11 +2,11 @@
 
 Date: 2026-10-24 (updated 2026-10-25)
 Cluster: `kind-helmsman-onprem` (Argo CD on `kind-helmsman-hub`)
-Commits: `3238a9b` (chart), `f0480d4`, `4a5ec89`, `e640677`, `57541b5`, `4ffcd4e` (fixes), `25aa17c` (image bump by `agentforge-bot`)
+Commits: `3238a9b` (chart), `f0480d4`, `4a5ec89`, `e640677`, `57541b5`, `4ffcd4e`, `1a1257a` (fixes), `25aa17c` (image bump by `agentforge-bot`)
 
 Commit `3238a9b` added the AgentForge Helm chart under `apps/agentforge/` and moved the
 `agentforge.helmsman.local` HTTPRoute from the oauth2-proxy manifests into the chart, plus a
-ReferenceGrant in `gateway-infra`. Seven issues had to be fixed before everything ran. Two
+ReferenceGrant in `gateway-infra`. Eight issues had to be fixed before everything ran. Two
 application-level issues remain for the AgentForge team (see [Open](#open-for-the-agentforge-team)).
 
 **Current state (2026-10-25)**
@@ -178,6 +178,20 @@ space-separated `-A gateway.orchestrator.celery_app`.)
 (`redis://agentforge-redis.<namespace>.svc.cluster.local:6379/0` and `/1`). Changing `envFrom` content
 doesn't restart pods, so the worker and gateway needed `kubectl rollout restart`. The worker then
 logged `Connected to redis://agentforge-redis…` and `celery@… ready`.
+
+## Issue 8: `/` showed oauth2-proxy's "Sign In" page with a 403
+
+**Symptom**
+
+`curl -H "Host: agentforge.helmsman.local" http://localhost:8888/` returned `403 Forbidden` and
+oauth2-proxy's HTML "Sign In" page instead of sending the browser to Keycloak.
+
+**Fix (`1a1257a`)**
+
+Add `--skip-provider-button=true` to oauth2-proxy. Unauthenticated requests now get
+`302 → http://<hub-ip>:30081/realms/helmsman/protocol/openid-connect/auth?…`. `/ping`, `/health` and
+`/oauth2/start` are unchanged. Argo CD only rolls the Deployment after a sync, which needs the
+`:9091` port-forward (see [Running argocd by hand](#running-argocd-by-hand)).
 
 ## Open for the AgentForge team
 
