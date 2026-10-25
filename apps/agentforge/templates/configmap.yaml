@@ -14,3 +14,8 @@ data:
   OLLAMA_BASE_URL:          {{ .Values.config.ollamaBaseUrl | quote }}
   CONFLUENCE_SPACE_KEY:     {{ .Values.config.confluenceSpaceKey | quote }}
   CONFLUENCE_ANCESTOR_ID:   {{ .Values.config.confluenceAncestorId | quote }}
+  # config/settings.py reads these (not REDIS_URL) for Celery; without them the
+  # worker falls back to redis://localhost:6379. Redis is the chart's own,
+  # unauthenticated, in-namespace StatefulSet.
+  CELERY_BROKER_URL:        "redis://agentforge-redis.{{ .Release.Namespace }}.svc.cluster.local:6379/0"
+  CELERY_RESULT_BACKEND:    "redis://agentforge-redis.{{ .Release.Namespace }}.svc.cluster.local:6379/1"
