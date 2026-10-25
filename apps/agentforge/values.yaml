@@ -46,7 +46,7 @@ worker:
   replicas: 1
   command:
     - celery
-    - -A=gateway.orchestrator.celery_app
+    - --app=gateway.orchestrator.celery_app   # short -A=... passes "=gateway..." as the module name
     - worker
     - --queues=sdlc,default
     - --concurrency=2
