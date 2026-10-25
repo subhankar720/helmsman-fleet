@@ -1089,6 +1089,47 @@ KY_GHCR=$(kubectl --context "$SPOKE_CONTEXT" -n kyverno get secret ghcr-pull-sec
 [ "$KY_GHCR" = "kubernetes.io/dockerconfigjson" ] && ok "ghcr-pull-secret present in kyverno (image signature checks can authenticate)" || \
     fail "ghcr-pull-secret missing in kyverno namespace — verify-agentforge-signatures can't read private images; $AF_FIX"
 
+# GHCR only accepts classic PATs (ghp_) or gh OAuth tokens (gho_) with
+# read:packages. A fine-grained PAT (github_pat_) authenticates but every
+# manifest read is 403 — Kyverno then rejects gateway/worker. gh OAuth tokens
+# are also replaced by `gh auth refresh` / logout, so test actual access.
+GHCR_CHECK=$(kubectl --context "$SPOKE_CONTEXT" -n agentforge get secret ghcr-pull-secret \
+    -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null | base64 -d 2>/dev/null | \
+    IMAGE="$(kubectl --context "$SPOKE_CONTEXT" -n agentforge get deploy agentforge-gateway \
+        -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)" python3 -c '
+import base64, json, os, sys, urllib.request, urllib.error
+try:
+    a = json.load(sys.stdin)["auths"]["ghcr.io"]
+except Exception:
+    print("FAIL unreadable"); sys.exit()
+user, tok = (a.get("username"), a.get("password")) if a.get("password") else base64.b64decode(a["auth"]).decode().split(":", 1)
+kind = "fine-grained PAT" if tok.startswith("github_pat_") else "classic PAT" if tok.startswith("ghp_") else "gh OAuth token" if tok.startswith("gho_") else "token"
+img = os.environ.get("IMAGE") or "ghcr.io/subhankar720/agentforge:latest"
+# Kyverno pins verified images as repo:tag@sha256:… — prefer the digest
+name, _, digest = img.split("ghcr.io/", 1)[1].partition("@")
+repo, _, tag = name.partition(":")
+ref = digest or tag or "latest"
+basic = base64.b64encode(("%s:%s" % (user, tok)).encode()).decode()
+try:
+    t = json.load(urllib.request.urlopen(urllib.request.Request(
+        "https://ghcr.io/token?scope=repository:%s:pull&service=ghcr.io" % repo,
+        headers={"Authorization": "Basic " + basic}), timeout=10))["token"]
+    urllib.request.urlopen(urllib.request.Request(
+        "https://ghcr.io/v2/%s/manifests/%s" % (repo, ref), method="HEAD",
+        headers={"Authorization": "Bearer " + t, "Accept": "application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"}), timeout=10)
+    print("OK %s can read %s" % (kind, img))
+except urllib.error.HTTPError as e:
+    print("FAIL %s cannot read %s (HTTP %s)%s" % (kind, img, e.code,
+          " — GHCR rejects fine-grained PATs; use a classic PAT or gh OAuth token with read:packages" if tok.startswith("github_pat_") else ""))
+except Exception as e:
+    print("WARN could not reach ghcr.io (%s)" % e)
+' 2>/dev/null || echo "FAIL ghcr-pull-secret missing in agentforge")
+case "$GHCR_CHECK" in
+    OK*)   ok   "ghcr-pull-secret: ${GHCR_CHECK#OK }" ;;
+    WARN*) warn "ghcr-pull-secret: ${GHCR_CHECK#WARN }" ;;
+    *)     fail "ghcr-pull-secret: ${GHCR_CHECK#FAIL }" ;;
+esac
+
 AF_ES=$(kubectl --context "$SPOKE_CONTEXT" -n agentforge get externalsecret agentforge-secrets \
     -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
 [ "$AF_ES" = "True" ] && ok "ExternalSecret agentforge/agentforge-secrets Ready" || \

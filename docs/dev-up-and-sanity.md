@@ -11,6 +11,10 @@ across Docker Desktop and laptop restarts:
 Run sanity at the start of a session or after any restart. If it reports failures, run dev-up,
 then sanity again.
 
+dev-up logs the `argocd` CLI in on its own port-forward (`:9090`), which closes when the script
+exits. To use the CLI afterwards, see
+[Running argocd by hand](troubleshooting/agentforge-chart-deploy-2026-10-24.md#running-argocd-by-hand).
+
 ## Where the scripts live
 
 `dev-up-gemini.sh` exists in two places, and the copies must stay identical:
@@ -34,7 +38,7 @@ runtime is lost on restart. dev-up backs it up here on every run and restores it
 | --- | --- | --- |
 | `argocd-admin-password` | Argo CD admin password (was `/tmp/helmsman-argocd-pass`, lost on reboot; migrated automatically) | `--reset`, or by hand |
 | `vault-agentforge.json` | `secret/agentforge/{auth,llm,db,cache,confluence}`. Live Vault wins; the backup only fills gaps. | Stage 10.5 |
-| `ghcr-pull-secret.json` | `.dockerconfigjson` for `ghcr-pull-secret`. Must hold a **classic** PAT with `read:packages`. | Stage 10.5 |
+| `ghcr-pull-secret.json` | `.dockerconfigjson` for `ghcr-pull-secret`. Must be a classic PAT (`ghp_`) or a `gh` OAuth token (`gho_`) with `read:packages`; GHCR rejects fine-grained PATs. Currently a `gho_` token, which `gh auth logout` or `gh auth refresh` replaces. | Stage 10.5, from the Secret in `agentforge` |
 | `keycloak-agentforge-user-password` | Password used if Keycloak user `subhankar` has to be recreated. Generated if missing. | you, or Stage 10.5 |
 | `last-dev-up` | Time of the last successful run. A node started after it counts as restarted. | Stage 11 |
 
@@ -106,7 +110,7 @@ silent for minutes).
 | G, H | Argo CD login; cluster and every Application's sync/health |
 | I | Every spoke pod |
 | J | Loki, Grafana datasource, live log shipping |
-| K | Applications exist; Envoy Gateway, GatewayClass, Gateway (NodePort); ReferenceGrant and `agentforge/agentforge` HTTPRoute; `gateway-infra` Keycloak URL; oauth2-proxy Secret, availability and config fingerprint; e2e gateway → oauth2-proxy → Keycloak; Vault paths and keys; Keycloak client, mapper, secret identical in Keycloak/Vault/K8s, groups, user; Kyverno policy; platform namespaces unlabelled; workloads blocked by Kyverno (only if still short of pods); `agentforge` namespace label and pull secrets (`agentforge`, `kyverno`); `agentforge-secrets` and workloads; backups present |
+| K | Applications exist; Envoy Gateway, GatewayClass, Gateway (NodePort); ReferenceGrant and `agentforge/agentforge` HTTPRoute; `gateway-infra` Keycloak URL; GHCR token can read the deployed image; oauth2-proxy Secret, availability and config fingerprint; e2e gateway → oauth2-proxy → Keycloak; Vault paths and keys; Keycloak client, mapper, secret identical in Keycloak/Vault/K8s, groups, user; Kyverno policy; platform namespaces unlabelled; workloads blocked by Kyverno (only if still short of pods); `agentforge` namespace label and pull secrets (`agentforge`, `kyverno`); `agentforge-secrets` and workloads; backups present |
 
 Probe pods in `helmsman.dev/managed` namespaces are created with `probe_overrides` (managed-by label,
 non-root, limits, no privilege escalation), so Kyverno doesn't reject the checks themselves.
@@ -119,12 +123,13 @@ non-root, limits, no privilege escalation), so Kyverno doesn't reject the checks
 | 2026-09-26 | [envoy-gateway-rollout](troubleshooting/envoy-gateway-rollout-2026-09-26.md) | OCI Helm `repoURL`, Envoy Gateway on spoke, exclude glob, NodePort `EnvoyProxy` |
 | 2026-10-03 | [agentforge-restart-resilience](troubleshooting/agentforge-restart-resilience-2026-10-03.md) | Vault/Keycloak backup and restore, oauth2-proxy issuer, ApplicationSet exclude, ServerSideDiff, kindnet CPU, Kyverno-safe probes |
 | 2026-10-24 | [hub-control-plane-reboot](troubleshooting/hub-control-plane-reboot-2026-10-24.md) | lost `kind` endpoint, host port 8080 conflict, Kyverno on platform namespaces, restart detection |
-| 2026-10-24 | [agentforge-chart-deploy](troubleshooting/agentforge-chart-deploy-2026-10-24.md) | Helm source, issuer regression, Kyverno GHCR credentials, chart Vault keys; **open:** classic PAT needed |
+| 2026-10-24/25 | [agentforge-chart-deploy](troubleshooting/agentforge-chart-deploy-2026-10-24.md) | Helm source, issuer regression, Kyverno GHCR credentials, chart Vault keys, `gh` OAuth pull token, Celery `--app` flag and broker URLs |
 
 ## Open items
 
-- **GHCR pull secret needs a classic PAT.** See
-  [agentforge-chart-deploy Issue 5](troubleshooting/agentforge-chart-deploy-2026-10-24.md#issue-5-ghcr-rejects-the-fine-grained-pat-open).
+- **AgentForge application issues** (team-owned): the `audit_runs` table is missing, and Groq
+  returns 404 for its model. See
+  [agentforge-chart-deploy](troubleshooting/agentforge-chart-deploy-2026-10-24.md#open-for-the-agentforge-team).
 - **Hub Kyverno is orphaned.** The controllers and 6 ClusterPolicies still run on the hub with no
   Application managing them.
 - **Vault and Keycloak have no persistence.** The `~/.helmsman-dev/` backups are the source of truth
