@@ -63,6 +63,7 @@ spec:
             - --pass-user-headers=true
             - --skip-auth-route=^/health
             - --skip-auth-route=^/metrics
+            - --skip-provider-button=true
             - --cookie-secure=false   # HTTP only for local dev — true in prod
             - --cookie-name=_helmsman_auth
           env:
