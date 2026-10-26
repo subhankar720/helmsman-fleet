@@ -10,10 +10,12 @@ data:
   AGENTFORGE_ENV:           {{ .Values.config.env | quote }}
   AGENTFORGE_LOG_LEVEL:     {{ .Values.config.logLevel | quote }}
   AGENTFORGE_AUTH_ENABLED:  {{ .Values.config.authEnabled | quote }}
-  HITL_AUTO_APPROVE:        {{ .Values.config.hitlAutoApprove | quote }}
+  AGENTFORGE_HITL_AUTO_APPROVE: {{ .Values.config.hitlAutoApprove | quote }}
   OLLAMA_BASE_URL:          {{ .Values.config.ollamaBaseUrl | quote }}
   CONFLUENCE_SPACE_KEY:     {{ .Values.config.confluenceSpaceKey | quote }}
   CONFLUENCE_ANCESTOR_ID:   {{ .Values.config.confluenceAncestorId | quote }}
+  GROQ_MODEL:               {{ .Values.config.groqModel | default "openai/gpt-oss-120b" | quote }}
+  LLM_HEALTH_CACHE_SECONDS: {{ .Values.config.llmHealthCacheSeconds | default 300 | quote }}
   # config/settings.py reads these (not REDIS_URL) for Celery; without them the
   # worker falls back to redis://localhost:6379. Redis is the chart's own,
   # unauthenticated, in-namespace StatefulSet.

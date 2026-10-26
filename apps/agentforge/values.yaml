@@ -129,6 +129,8 @@ config:
   ollamaBaseUrl: http://host.docker.internal:11434/v1
   confluenceSpaceKey: "~712020e0e86f151c104276b5ec2e685ae3b22e"
   confluenceAncestorId: "589825"
+  groqModel: openai/gpt-oss-120b      # Groq production tier; change here if Groq retires it again
+  llmHealthCacheSeconds: 300          # /health/ready LLM probe cache (failures cached <=30s)
 
 # ── External Secrets ──────────────────────────────────────────────────────────
 externalSecrets:
@@ -146,6 +148,15 @@ serviceMonitor:
 
 grafanaDashboard:
   enabled: true
+
+# ── Jobs ──────────────────────────────────────────────────────────────────────
+migrations:
+  enabled: true                        # PostSync job that applies files/init.sql
+
+ingest:
+  enabled: true
+  schedule: "0 2 * * *"
+  suspend: true                        # run on demand; set false for nightly re-index
 
 # ── Network Policies ──────────────────────────────────────────────────────────
 networkPolicies:

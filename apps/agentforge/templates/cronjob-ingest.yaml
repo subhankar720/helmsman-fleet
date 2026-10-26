@@ -1,0 +1,51 @@
+{{- if (.Values.ingest | default dict).enabled }}
+# Re-indexes the Confluence knowledge base into Postgres. Idempotent (chunk ids are
+# content hashes; duplicates are skipped). Suspended by default - run on demand:
+#   kubectl -n agentforge create job --from=cronjob/agentforge-ingest ingest-now
+#   kubectl -n agentforge logs -f job/ingest-now
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: agentforge-ingest
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.ingest.schedule | default "0 2 * * *" | quote }}
+  suspend: {{ ne (toString .Values.ingest.suspend) "false" }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            {{- include "agentforge.labels" . | nindent 12 }}
+            app.kubernetes.io/name: agentforge-ingest
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ .Values.serviceAccount.name }}
+          securityContext:
+            {{- include "agentforge.podSecurityContext" . | nindent 12 }}
+          imagePullSecrets:
+            {{- toYaml .Values.imagePullSecrets | nindent 12 }}
+          containers:
+            - name: ingest
+              image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # space key / ancestor id / credentials come from the ConfigMap + Secret
+              command: ["python", "scripts/ingest_confluence.py"]
+              securityContext:
+                {{- include "agentforge.containerSecurityContext" . | nindent 16 }}
+              envFrom:
+                - configMapRef:
+                    name: agentforge-config
+                - secretRef:
+                    name: agentforge-secrets
+              resources:
+                requests: { cpu: 100m, memory: 128Mi }
+                limits:   { cpu: 500m, memory: 512Mi }
+{{- end }}
