@@ -3,7 +3,7 @@
 
 image:
   repository: ghcr.io/subhankar720/agentforge
-  tag: "5e1c565905dffbae86d858a52009e99d4fae2a77"
+  tag: "ff226856c372bec922a5491c97cfa60f644d01f3"
   pullPolicy: IfNotPresent
 
 imagePullSecrets:
