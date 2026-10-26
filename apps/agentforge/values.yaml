@@ -36,7 +36,7 @@ gateway:
     periodSeconds: 20
   readinessProbe:
     httpGet:
-      path: /health/ready
+      path: /health
       port: 8000
     initialDelaySeconds: 10
     periodSeconds: 10
