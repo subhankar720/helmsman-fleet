@@ -21,9 +21,6 @@ spec:
             value: /health
         - path:
             type: Exact
-            value: /health/ready
-        - path:
-            type: Exact
             value: /metrics
       backendRefs:
         - name: agentforge-gateway
