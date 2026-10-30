@@ -123,12 +123,14 @@ non-root, limits, no privilege escalation), so Kyverno doesn't reject the checks
 | 2026-09-26 | [envoy-gateway-rollout](troubleshooting/envoy-gateway-rollout-2026-09-26.md) | OCI Helm `repoURL`, Envoy Gateway on spoke, exclude glob, NodePort `EnvoyProxy` |
 | 2026-10-03 | [agentforge-restart-resilience](troubleshooting/agentforge-restart-resilience-2026-10-03.md) | Vault/Keycloak backup and restore, oauth2-proxy issuer, ApplicationSet exclude, ServerSideDiff, kindnet CPU, Kyverno-safe probes |
 | 2026-10-24 | [hub-control-plane-reboot](troubleshooting/hub-control-plane-reboot-2026-10-24.md) | lost `kind` endpoint, host port 8080 conflict, Kyverno on platform namespaces, restart detection |
+| 2026-10-30 | [laptop-reboot-and-e2e](troubleshooting/laptop-reboot-and-e2e-2026-10-30.md) | clean reboot recovery; Loki check retries; AgentForge e2e blocked by Groq 8k TPM limit |
 | 2026-10-24/25 | [agentforge-chart-deploy](troubleshooting/agentforge-chart-deploy-2026-10-24.md) | Helm source, issuer regression, Kyverno GHCR credentials, chart Vault keys, `gh` OAuth pull token, Celery `--app` flag and broker URLs |
 
 ## Open items
 
-- **AgentForge application issues** (team-owned): the `audit_runs` table is missing, and Groq
-  returns 404 for its model. See
+- **AgentForge application issues** (team-owned): multi-agent pipelines fail on Groq's 8,000
+  tokens-per-minute limit (the router needs to back off on 429), and the chart's `HITL_AUTO_APPROVE`
+  is ignored (the app reads `AGENTFORGE_HITL_AUTO_APPROVE`). The `audit_runs` table is fixed by Phase 7. See
   [agentforge-chart-deploy](troubleshooting/agentforge-chart-deploy-2026-10-24.md#open-for-the-agentforge-team).
 - **Hub Kyverno is orphaned.** The controllers and 6 ClusterPolicies still run on the hub with no
   Application managing them.

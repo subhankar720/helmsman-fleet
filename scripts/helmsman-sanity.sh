@@ -753,10 +753,23 @@ else
 fi
 
 # Loki /ready reachable in-cluster (in-cluster DNS, no IP drift involved)
+# Retried with a fresh pod name: `run --rm -i` can lose the output when the
+# attach races the container, and Loki answers "not ready" for a while after a
+# restart — neither means Loki is down.
+LOKI_READY_OK=false
+for attempt in 1 2 3; do
+    LH_POD="loki-health-check-$attempt-$$"
+    if kubectl --context "$HUB_CONTEXT" -n monitoring run --quiet --rm -i --restart=Never "$LH_POD" \
+        --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 http://platform-loki.monitoring.svc.cluster.local:3100/ready" \
+        2>/dev/null | grep -q "ready"; then
+        LOKI_READY_OK=true
+        break
+    fi
+    kubectl --context "$HUB_CONTEXT" -n monitoring delete pod "$LH_POD" --ignore-not-found > /dev/null 2>&1 || true
+    sleep 5
+done
 kubectl --context "$HUB_CONTEXT" -n monitoring delete pod loki-health-check --ignore-not-found > /dev/null 2>&1 || true
-if kubectl --context "$HUB_CONTEXT" -n monitoring run --quiet --rm -i --restart=Never loki-health-check \
-    --image=curlimages/curl:latest -- sh -c "curl -fsS --max-time 5 http://platform-loki.monitoring.svc.cluster.local:3100/ready" \
-    2>/dev/null | grep -q "ready"; then
+if $LOKI_READY_OK; then
     ok "Loki /ready reachable at platform-loki.monitoring.svc.cluster.local:3100"
 else
     fail "Loki /ready NOT reachable at platform-loki.monitoring.svc.cluster.local:3100"
