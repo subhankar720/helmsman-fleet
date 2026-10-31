@@ -58,9 +58,20 @@ spec:
             - --http-address=0.0.0.0:4180
             - --email-domain=*
             - --scope=openid profile email
+            # Identity reaches AgentForge as X-Forwarded-{User,Email,Groups,Preferred-Username}
+            # (--pass-user-headers; client-sent copies are overwritten/stripped).
+            # --set-xauthrequest only sets X-Auth-Request-* on *responses* (nginx
+            # auth_request mode) — upstream never gets them from oauth2-proxy, and
+            # client-sent X-Auth-Request-* pass through untouched, so never trust them.
             - --set-xauthrequest=true
-            - --pass-access-token=true
+            # Off: nothing in AgentForge reads X-Forwarded-Access-Token. Turn back on
+            # only if the app starts verifying the JWT itself.
+            - --pass-access-token=false
             - --pass-user-headers=true
+            # Accept Keycloak access tokens as "Authorization: Bearer" (CLI/SDK via
+            # the agentforge-cli client). Validated against the OIDC issuer; the
+            # token's aud must include agentforge-gateway (audience mapper).
+            - --skip-jwt-bearer-tokens=true
             - --skip-auth-route=^/health$
             - --skip-auth-route=^/metrics$
             - --skip-provider-button=true
