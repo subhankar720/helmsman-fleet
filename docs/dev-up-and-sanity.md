@@ -40,6 +40,7 @@ runtime is lost on restart. dev-up backs it up here on every run and restores it
 | `vault-agentforge.json` | `secret/agentforge/{auth,llm,db,cache,confluence}`. Live Vault wins; the backup only fills gaps. | Stage 10.5 |
 | `ghcr-pull-secret.json` | `.dockerconfigjson` for `ghcr-pull-secret`. Must be a classic PAT (`ghp_`) or a `gh` OAuth token (`gho_`) with `read:packages`; GHCR rejects fine-grained PATs. Currently a `gho_` token, which `gh auth logout` or `gh auth refresh` replaces. | Stage 10.5, from the Secret in `agentforge` |
 | `keycloak-agentforge-user-password` | Password used if Keycloak user `subhankar` has to be recreated. Generated if missing. | you, or Stage 10.5 |
+| `keycloak-af-platform-user-password`, `keycloak-af-readonly-user-password` | Passwords of the AgentForge test users. Generated on first creation. | Stage 10.5 |
 | `last-dev-up` | Time of the last successful run. A node started after it counts as restarted. | Stage 11 |
 
 ## dev-up stages
@@ -85,11 +86,14 @@ silent for minutes).
 3. Vault `secret/agentforge/*`: restore missing paths from backup; keep `auth.keycloak_url` on the
    current hub IP; add any keys the AgentForge chart reads that are missing (`db`/`cache` generated,
    `llm`/`confluence` empty); write the backup.
-4. Keycloak (via port-forward on 18081): groups `dev-team`, `platform-team`, `readonly`; client
-   `agentforge-gateway` with the groups mapper and the **Vault** client secret; public client
-   `agentforge-cli` (password grant, groups + audience mappers) for CLI/SDK bearer tokens; user `subhankar`
-   (first/last name and verified email, otherwise logins fail with "Account is not fully set up")
-   in `dev-team`.
+4. Keycloak (via port-forward on 18081): groups `/teams/dev-team`, `/teams/platform-team`, `/readonly`
+   (`AF_KC_GROUPS`; an old flat `dev-team`/`platform-team` is moved under `/teams`, keeping members); client
+   `agentforge-gateway` with the groups mapper (`full.path=true`) and the **Vault** client secret; public client
+   `agentforge-cli` (password grant, groups + audience mappers) for CLI/SDK bearer tokens; drifted mapper
+   config is re-aligned. Users from `AF_KC_USERS`: `subhankar` in `/teams/dev-team`, `af-platform-user` in
+   `/teams/platform-team`, `af-readonly-user` in `/teams/dev-team` + `/readonly` (test users' passwords in
+   `~/.helmsman-dev/keycloak-<user>-password`). Users are created with first/last name and a verified email;
+   otherwise logins fail with "Account is not fully set up".
 5. Force-sync oauth2-proxy's ExternalSecret. Restart oauth2-proxy when the fingerprint of its
    Keycloak URL and credentials (annotation `helmsman.dev/config-fingerprint`) changes.
 6. Kyverno `verify-agentforge-signatures` Ready, otherwise hard-refresh the policies app.
@@ -111,7 +115,7 @@ silent for minutes).
 | G, H | Argo CD login; cluster and every Application's sync/health |
 | I | Every spoke pod |
 | J | Loki, Grafana datasource, live log shipping |
-| K | Applications exist; Envoy Gateway, GatewayClass, Gateway (NodePort); ReferenceGrant and `agentforge/agentforge` HTTPRoute; `gateway-infra` Keycloak URL; GHCR token can read the deployed image; oauth2-proxy Secret, availability and config fingerprint; e2e gateway → oauth2-proxy → Keycloak; Vault paths and keys; Keycloak client, mapper, secret identical in Keycloak/Vault/K8s, groups, user; Kyverno policy; platform namespaces unlabelled; workloads blocked by Kyverno (only if still short of pods); `agentforge` namespace label and pull secrets (`agentforge`, `kyverno`); `agentforge-secrets` and workloads; backups present |
+| K | Applications exist; Envoy Gateway, GatewayClass, Gateway (NodePort); ReferenceGrant and `agentforge/agentforge` HTTPRoute; `gateway-infra` Keycloak URL; GHCR token can read the deployed image; oauth2-proxy Secret, availability and config fingerprint; e2e gateway → oauth2-proxy → Keycloak; unauthenticated `/v1/agents` 401 and an authenticated `GET /v1/agents` 200 as `subhankar` (no agent run, no LLM call); Vault paths and keys; Keycloak client, mapper (`full.path=true`), secret identical in Keycloak/Vault/K8s, team/role groups, each test user's groups; Kyverno policy; platform namespaces unlabelled; workloads blocked by Kyverno (only if still short of pods); `agentforge` namespace label and pull secrets (`agentforge`, `kyverno`); `agentforge-secrets` and workloads; backups present |
 
 Probe pods in `helmsman.dev/managed` namespaces are created with `probe_overrides` (managed-by label,
 non-root, limits, no privilege escalation), so Kyverno doesn't reject the checks themselves.

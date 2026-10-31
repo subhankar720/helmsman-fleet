@@ -89,12 +89,17 @@ AF_GHCR_BACKUP="$HELMSMAN_STATE_DIR/ghcr-pull-secret.json"
 AF_USER_PASS_FILE="$HELMSMAN_STATE_DIR/keycloak-agentforge-user-password"
 AF_VAULT_PATHS="auth llm db cache confluence"
 AF_KC_CLIENT="agentforge-gateway"
-AF_KC_GROUPS="dev-team platform-team readonly"
+# Groups by full path; the groups mappers use full.path=true, so tokens (and
+# X-Forwarded-Groups) carry "/teams/dev-team". Exactly one /teams/* group per
+# user is AgentForge's team; /readonly is a role on top of it.
+AF_KC_GROUPS="/teams/dev-team /teams/platform-team /readonly"
 AF_KC_USER="subhankar"
 AF_KC_USER_EMAIL="subhankar@helmsman.dev"
 AF_KC_USER_FIRST="Subhankar"
 AF_KC_USER_LAST="Padhy"
-AF_KC_USER_GROUP="dev-team"
+# user:group,group … — test users get <user>@helmsman.dev and a generated
+# password in $HELMSMAN_STATE_DIR/keycloak-<user>-password.
+AF_KC_USERS="subhankar:/teams/dev-team af-platform-user:/teams/platform-team af-readonly-user:/teams/dev-team,/readonly"
 AF_KC_PF_PORT="18081"
 
 RESET_MODE=false
@@ -1264,9 +1269,10 @@ else
   if KC_URL="http://localhost:${AF_KC_PF_PORT}" KC_ADMIN_USER="$KEYCLOAK_ADMIN_USER" \
     KC_ADMIN_PASS="$KEYCLOAK_ADMIN_PASS" AF_VAULT_BACKUP="$AF_VAULT_BACKUP" \
     AF_KC_CLIENT="$AF_KC_CLIENT" AF_KC_GROUPS="$AF_KC_GROUPS" AF_KC_USER="$AF_KC_USER" \
-    AF_KC_USER_EMAIL="$AF_KC_USER_EMAIL" AF_KC_USER_GROUP="$AF_KC_USER_GROUP" \
+    AF_KC_USER_EMAIL="$AF_KC_USER_EMAIL" AF_KC_USERS="$AF_KC_USERS" \
     AF_KC_USER_FIRST="$AF_KC_USER_FIRST" AF_KC_USER_LAST="$AF_KC_USER_LAST" \
     AF_USER_PASS_FILE="$AF_USER_PASS_FILE" AF_KC_USER_PASS="${AF_KC_USER_PASS:-}" \
+    HELMSMAN_STATE_DIR="$HELMSMAN_STATE_DIR" \
     python3 -u - 2>&1 <<'PY' | af_log_lines
 import json, os, secrets, sys, urllib.error, urllib.parse, urllib.request
 
@@ -1302,24 +1308,60 @@ try:
         client_secret = json.load(f)["auth"]["keycloak_client_secret"]
     failed = False
 
-    # Groups
-    groups = {g["name"]: g["id"] for g in req("GET", realm + "/groups?max=1000", token=T)[1]}
-    for g in E["AF_KC_GROUPS"].split():
-        if g in groups:
-            print("OK: Keycloak group %s present" % g)
+    # Groups, by full path. A top-level group with a nested group's name (the
+    # flat dev-team/platform-team from before 2026-10-31) is moved under its
+    # parent, keeping its members.
+    def ensure_group(path):
+        st, g = req("GET", realm + "/group-by-path" + urllib.parse.quote(path), token=T)
+        if st == 200:
+            return g["id"]
+        parent, name = path.rsplit("/", 1)
+        if not parent:
+            st, _ = req("POST", realm + "/groups", {"name": name}, token=T)
+            what = "created"
         else:
-            st, _ = req("POST", realm + "/groups", {"name": g}, token=T)
-            print(("OK: Keycloak group %s was missing — created" if st in (201, 409) else
-                   "ERR: Keycloak group %s create failed (" + str(st) + ")") % g)
-            failed |= st not in (201, 409)
-    groups = {g["name"]: g["id"] for g in req("GET", realm + "/groups?max=1000", token=T)[1]}
+            pid = ensure_group(parent)
+            st, flat = req("GET", realm + "/group-by-path/" + urllib.parse.quote(name), token=T)
+            body, what = ({"id": flat["id"], "name": name}, "moved from /" + name) if st == 200 \
+                else ({"name": name}, "created")
+            st, _ = req("POST", "%s/groups/%s/children" % (realm, pid), body, token=T)
+        if st not in (201, 204):
+            raise RuntimeError("group %s: %s failed (%s)" % (path, what, st))
+        print("OK: Keycloak group %s was missing — %s" % (path, what))
+        return req("GET", realm + "/group-by-path" + urllib.parse.quote(path), token=T)[1]["id"]
+
+    groups = {}
+    for g in E["AF_KC_GROUPS"].split():
+        groups[g] = ensure_group(g)
+        print("OK: Keycloak group %s present" % g)
 
     # Client + groups mapper + secret
     mapper = {"name": "groups", "protocol": "openid-connect",
               "protocolMapper": "oidc-group-membership-mapper", "consentRequired": False,
-              "config": {"full.path": "false", "id.token.claim": "true",
+              "config": {"full.path": "true", "id.token.claim": "true",
                          "access.token.claim": "true", "claim.name": "groups",
                          "userinfo.token.claim": "true"}}
+
+    def ensure_mappers(c, wanted):
+        """Add missing mappers and re-align drifted config. Returns True on failure."""
+        have = {m.get("protocolMapper"): m for m in c.get("protocolMappers", [])}
+        bad = False
+        for m in wanted:
+            cur = have.get(m["protocolMapper"])
+            if cur is None:
+                st, _ = req("POST", "%s/clients/%s/protocol-mappers/models" % (realm, c["id"]), m, token=T)
+                print("OK: %s %s mapper was missing — added" % (c["clientId"], m["name"]) if st == 201
+                      else "ERR: %s %s mapper add failed (%s)" % (c["clientId"], m["name"], st))
+                bad |= st != 201
+            elif any(cur["config"].get(k) != v for k, v in m["config"].items()):
+                cur["config"].update(m["config"])
+                st, _ = req("PUT", "%s/clients/%s/protocol-mappers/models/%s" % (realm, c["id"], cur["id"]),
+                            cur, token=T)
+                print("OK: %s %s mapper config re-aligned" % (c["clientId"], m["name"]) if st == 204
+                      else "ERR: %s %s mapper update failed (%s)" % (c["clientId"], m["name"], st))
+                bad |= st != 204
+        return bad
+
     cid = E["AF_KC_CLIENT"]
     found = req("GET", realm + "/clients?clientId=" + urllib.parse.quote(cid), token=T)[1]
     if not found:
@@ -1335,12 +1377,8 @@ try:
     else:
         c = found[0]
         print("OK: Keycloak client %s present" % cid)
-        if not any(m.get("protocolMapper") == mapper["protocolMapper"] for m in c.get("protocolMappers", [])):
-            st, _ = req("POST", "%s/clients/%s/protocol-mappers/models" % (realm, c["id"]), mapper, token=T)
-            print("OK: groups mapper was missing — added" if st == 201 else "ERR: groups mapper add failed (%s)" % st)
-            failed |= st != 201
-        else:
-            print("OK: Keycloak client %s has groups mapper" % cid)
+        failed |= ensure_mappers(c, [mapper])
+        print("OK: Keycloak client %s has groups mapper (full.path=true)" % cid)
         cur = req("GET", "%s/clients/%s/client-secret" % (realm, c["id"]), token=T)[1] or {}
         if cur.get("value") != client_secret:
             c["secret"] = client_secret
@@ -1370,51 +1408,53 @@ try:
               else "ERR: Keycloak client agentforge-cli create failed (%s)" % st)
         failed |= st != 201
     else:
-        have = {m.get("protocolMapper") for m in cli[0].get("protocolMappers", [])}
-        for m in (mapper, aud_mapper):
-            if m["protocolMapper"] not in have:
-                st, _ = req("POST", "%s/clients/%s/protocol-mappers/models" % (realm, cli[0]["id"]), m, token=T)
-                print("OK: agentforge-cli %s mapper was missing — added" % m["name"] if st == 201
-                      else "ERR: agentforge-cli %s mapper add failed (%s)" % (m["name"], st))
-                failed |= st != 201
+        failed |= ensure_mappers(cli[0], [mapper, aud_mapper])
         print("OK: Keycloak client agentforge-cli present with groups + audience mappers")
 
-    # User + group membership
-    uname = E["AF_KC_USER"]
-    users = req("GET", realm + "/users?exact=true&username=" + urllib.parse.quote(uname), token=T)[1]
-    if users:
-        uid = users[0]["id"]
-        print("OK: Keycloak user %s present" % uname)
-    else:
-        pw = E.get("AF_KC_USER_PASS") or ""
-        pf = E["AF_USER_PASS_FILE"]
-        if not pw and os.path.exists(pf):
-            pw = open(pf).read().strip()
-        generated = not pw
-        if generated:
-            pw = secrets.token_urlsafe(12)
-        # first/last name + verified email: Keycloak's user profile otherwise
-        # marks the account "not fully set up" and refuses logins
-        st, _ = req("POST", realm + "/users", {
-            "username": uname, "email": E["AF_KC_USER_EMAIL"], "emailVerified": True,
-            "firstName": E["AF_KC_USER_FIRST"], "lastName": E["AF_KC_USER_LAST"], "enabled": True,
-            "credentials": [{"type": "password", "value": pw, "temporary": False}]}, token=T)
-        if st != 201:
-            print("ERR: Keycloak user %s create failed (%s)" % (uname, st)); sys.exit(1)
-        if generated or not os.path.exists(pf):
-            with open(os.open(pf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
-                f.write(pw)
-        print(("WARN: Keycloak user %s was missing — created with a NEW password saved in %s" if generated else
-               "OK: Keycloak user %s was missing — recreated with the password from %s") % (uname, pf))
-        uid = req("GET", realm + "/users?exact=true&username=" + urllib.parse.quote(uname), token=T)[1][0]["id"]
-    member_of = {g["name"] for g in req("GET", "%s/users/%s/groups" % (realm, uid), token=T)[1]}
-    g = E["AF_KC_USER_GROUP"]
-    if g in member_of:
-        print("OK: %s is in %s" % (uname, g))
-    elif g in groups:
-        st, _ = req("PUT", "%s/users/%s/groups/%s" % (realm, uid, groups[g]), token=T)
-        print(("OK: %s added to %s" if st == 204 else "ERR: adding %s to %s failed (" + str(st) + ")") % (uname, g))
-        failed |= st != 204
+    # Users + group membership
+    for spec in E["AF_KC_USERS"].split():
+        uname, _, want = spec.partition(":")
+        main = uname == E["AF_KC_USER"]
+        pf = E["AF_USER_PASS_FILE"] if main else "%s/keycloak-%s-password" % (E["HELMSMAN_STATE_DIR"], uname)
+        users = req("GET", realm + "/users?exact=true&username=" + urllib.parse.quote(uname), token=T)[1]
+        if users:
+            uid = users[0]["id"]
+            print("OK: Keycloak user %s present" % uname)
+        else:
+            pw = (E.get("AF_KC_USER_PASS") or "") if main else ""
+            if not pw and os.path.exists(pf):
+                pw = open(pf).read().strip()
+            generated = not pw
+            if generated:
+                pw = secrets.token_urlsafe(12)
+            # first/last name + verified email: Keycloak's user profile otherwise
+            # marks the account "not fully set up" and refuses logins
+            st, _ = req("POST", realm + "/users", {
+                "username": uname, "email": E["AF_KC_USER_EMAIL"] if main else uname + "@helmsman.dev",
+                "emailVerified": True, "enabled": True,
+                "firstName": E["AF_KC_USER_FIRST"] if main else "AgentForge",
+                "lastName": E["AF_KC_USER_LAST"] if main else uname,
+                "credentials": [{"type": "password", "value": pw, "temporary": False}]}, token=T)
+            if st != 201:
+                print("ERR: Keycloak user %s create failed (%s)" % (uname, st)); sys.exit(1)
+            if generated or not os.path.exists(pf):
+                with open(os.open(pf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+                    f.write(pw)
+            print(("%s: Keycloak user %s was missing — created with a NEW password saved in %s" if generated else
+                   "%s: Keycloak user %s was missing — recreated with the password from %s")
+                  % ("WARN" if generated and main else "OK", uname, pf))
+            uid = req("GET", realm + "/users?exact=true&username=" + urllib.parse.quote(uname), token=T)[1][0]["id"]
+        member_of = {g["path"] for g in req("GET", "%s/users/%s/groups" % (realm, uid), token=T)[1]}
+        for g in want.split(","):
+            if g in member_of:
+                continue
+            st, _ = req("PUT", "%s/users/%s/groups/%s" % (realm, uid, groups[g]), token=T)
+            print(("OK: %s added to %s" if st == 204 else "ERR: adding %s to %s failed (" + str(st) + ")") % (uname, g))
+            failed |= st != 204
+        print("OK: %s is in %s" % (uname, want))
+        extra = member_of - set(want.split(","))
+        if extra:
+            print("WARN: %s is also in %s (not in AF_KC_USERS)" % (uname, ",".join(sorted(extra))))
     sys.exit(1 if failed else 0)
 except Exception as e:
     print("ERR: Keycloak AgentForge setup failed: %s" % e)

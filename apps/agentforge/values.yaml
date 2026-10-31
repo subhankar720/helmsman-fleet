@@ -108,8 +108,15 @@ httproute:
     namespace: gateway-infra
   # Authenticated traffic routes through the Helmsman-managed oauth2-proxy in
   # gateway-infra (a ReferenceGrant there permits the cross-namespace backend).
-  # oauth2-proxy injects X-Auth-Request-User / -Email / -Groups headers.
-  # Team id: request.headers.get("X-Auth-Request-Groups", "").split(",")[0]
+  # oauth2-proxy sets X-Forwarded-User / -Email / -Preferred-Username / -Groups
+  # (client-sent copies are overwritten). Never read X-Auth-Request-*: clients
+  # can forge them. Team = the one X-Forwarded-Groups entry starting "/teams/"
+  # (order isn't stable; see docs/agentforge-identity-integration.md).
+  #
+  # Envoy Gateway's default route timeout is 15 s, which cuts off synchronous
+  # agent/pipeline runs and SSE streams. Applies to the authenticated rule.
+  timeouts:
+    request: 360s
   oauth2Proxy:
     name: agentforge-oauth2-proxy
     namespace: gateway-infra

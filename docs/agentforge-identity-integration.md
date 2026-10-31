@@ -2,8 +2,9 @@
 
 Date: 2026-10-31
 Cluster: `kind-helmsman-onprem` (AgentForge, oauth2-proxy, Envoy Gateway), `kind-helmsman-hub` (Keycloak, Vault)
-Platform commits: `02ae6b5` (oauth2-proxy flags). The `agentforge-cli` Keycloak client is created by
-`dev-up-gemini.sh` Stage 10.5 and checked by `helmsman-sanity.sh` section K.
+Platform commits: `02ae6b5` (oauth2-proxy flags), then the [follow-up round](#follow-up-round-2026-10-31-labels-api-route-users-teams-timeouts-sanity)
+(`--api-route`, `--upstream-timeout`, team groups, test users, route timeout). The `agentforge-cli` Keycloak
+client, groups and users are created by `dev-up-gemini.sh` Stage 10.5 and checked by `helmsman-sanity.sh` section K.
 
 Every answer below was **tested on the live clusters**, not inferred from documentation. The header
 behaviour came from a throwaway copy of oauth2-proxy (same image, same flags and secrets) pointed at an
@@ -20,13 +21,13 @@ HTTP echo server, plus a throwaway Keycloak user in three groups. Both were remo
 
 | # | Question | Answer |
 | --- | --- | --- |
-| 1 | `--skip-jwt-bearer-tokens` + `agentforge-cli` client | **Done.** Bearer tokens from `agentforge-cli` get 200 through the gateway. Missing or tampered tokens get 302. |
+| 1 | `--skip-jwt-bearer-tokens` + `agentforge-cli` client | **Done.** Bearer tokens from `agentforge-cli` get 200 through the gateway. Missing or tampered tokens get **401 on `/v1/*`** (`--api-route`, follow-up round) and 302 elsewhere. |
 | 1 | Exact issuer | `http://172.18.0.2:30081/realms/helmsman` today. It is **not stable**: the IP changes on reboot, and tokens requested through any other URL are rejected. |
 | 1 | Test token for `subhankar` | Password grant on `agentforge-cli`, requested from inside the cluster (see below) |
 | 2 | CNI / NetworkPolicy negative test | **kindnet**, which enforces NetworkPolicy. The negative test ran: `default` and `sample-app` are blocked, and 4 namespaces can still reach the gateway directly. |
 | 3 | `--pass-access-token` | **Not needed. Turned off** (`02ae6b5`). Nothing in AgentForge reads it. |
-| 4 | Multi-group header | `X-Forwarded-Groups: dev-team,platform-team,readonly`: comma-separated, no spaces, ordered alphabetically by Keycloak. **Don't rely on order.** |
-| 4 | Dedicated team claim | Yes in Keycloak. Getting it into a header needs an oauth2-proxy change; options below. |
+| 4 | Multi-group header | Comma-separated, no spaces, full group paths since the follow-up round: `X-Forwarded-Groups: /teams/dev-team,/readonly`. **Order is not stable** (not alphabetical either). |
+| 4 | Dedicated team claim | **Option A implemented** (follow-up round): exactly one `/teams/<name>` group per user. |
 | 6 | Vault backups include Groq key and Confluence token? | **Yes.** dev-up Stage 10.5 re-seeds them automatically from `~/.helmsman-dev/vault-agentforge.json`. |
 
 ## Q1: bearer tokens, the `agentforge-cli` client, the issuer, and a test token
@@ -227,12 +228,12 @@ The same request plus forged headers `X-Auth-Request-Groups: admins`, `X-Forward
 
 - One header, **comma-separated with no spaces**: `X-Forwarded-Groups: dev-team,platform-team,readonly`.
   Split on `,` and trim.
-- Group names are the Keycloak group names (`full.path=false`). With `full.path=true` they'd be `/dev-team`.
-- **Order isn't something to rely on.** The throwaway user joined the groups in the order `readonly`,
-  `platform-team`, `dev-team`, and the token listed them `dev-team, platform-team, readonly`: alphabetical.
-  That's how Keycloak's group mapper happens to behave, not a documented guarantee. **"Team = first
-  group" would also break** as soon as someone joins a group that sorts earlier (for example `admins`
-  before `dev-team`).
+- ~~Group names are the Keycloak group names (`full.path=false`).~~ **Since the follow-up round the mappers
+  use `full.path=true`**, so entries are full paths: `/teams/dev-team`, `/readonly`.
+- **Order isn't something to rely on.** In the first test the token happened to list three flat groups
+  alphabetically. In the follow-up round, `af-readonly-user` (added to `/teams/dev-team`, then `/readonly`)
+  got `/teams/dev-team,/readonly`: **not** alphabetical. Treat the header as an unordered set. **"Team = first
+  group" breaks.**
 
 ### A dedicated team claim
 
@@ -250,8 +251,8 @@ username, so a custom claim needs one of these:
 | **C. App verifies the JWT** | `--pass-access-token=true` again; AgentForge validates the token (JWKS from the issuer) and reads `team` | Most flexible, but AgentForge has to do JWT verification and depends on a stable issuer (Q1) |
 
 Recommendation: **A** for now, because it needs no proxy change and gives one unambiguous team per user.
-Move to **B** if more claims are needed. Tell me which one and I'll set up the Keycloak side (and dev-up
-recreation) to match.
+Move to **B** if more claims are needed. **A is now implemented**; see the
+[follow-up round](#4-team-groups-option-a-implemented).
 
 ## Q6: Vault dev-mode backups and re-seeding
 
@@ -285,6 +286,165 @@ How it behaves, and the gaps to know about:
   Secrets, so running pods keep working.
 - The backup is **plaintext on the laptop** (mode 600, `~/.helmsman-dev/`). Fine for local dev; not for
   shared or cloud environments. The proper fix is Vault with persistent storage (on the cloud-migration inventory).
+
+## Follow-up round (2026-10-31): labels, api-route, users, teams, timeouts, sanity
+
+The AgentForge team's second set of questions. Everything was tested live. Timeouts and headers were
+measured with a throwaway namespace `af-stream-test` (a slow/SSE test server, two copies of oauth2-proxy
+v7.7.1 with the production flags, test HTTPRoutes on `helmsman-gateway`), deleted afterwards.
+
+### 1. Pod labels for the narrowed NetworkPolicy
+
+Use these; don't use `pod-template-hash` or the hashed Envoy Deployment name, which change.
+
+| Source | Namespace (`kubernetes.io/metadata.name`) | Pod labels to select | Needs to reach |
+| --- | --- | --- | --- |
+| oauth2-proxy | `gateway-infra` | `app.kubernetes.io/name: agentforge-oauth2-proxy` | gateway `:8000`, all paths |
+| Envoy proxy (data plane) | `envoy-gateway-system` | `app.kubernetes.io/name: envoy`, `app.kubernetes.io/component: proxy`, `gateway.envoyproxy.io/owning-gateway-name: helmsman-gateway`, `gateway.envoyproxy.io/owning-gateway-namespace: gateway-infra` | gateway `:8000`, only for `/health` and `/metrics` (HTTPRoute rule 1) |
+| Envoy Gateway controller | `envoy-gateway-system` | `control-plane: envoy-gateway` | **nothing**: it never talks to AgentForge; leave it out |
+
+Narrowed rule (both selectors in **one** `from` entry, so they're ANDed):
+
+```yaml
+ingress:
+  - from:
+      - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: gateway-infra}}
+        podSelector:       {matchLabels: {app.kubernetes.io/name: agentforge-oauth2-proxy}}
+      - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: envoy-gateway-system}}
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: envoy
+            gateway.envoyproxy.io/owning-gateway-name: helmsman-gateway
+    ports: [{port: 8000, protocol: TCP}]
+```
+
+Things to know when writing it:
+
+- **NetworkPolicies add up.** Narrowing `agentforge-allow-ingress` isn't enough while
+  `agentforge-allow-prometheus` admits the whole `monitoring` namespace on 8000. On the spoke, `monitoring`
+  holds **only Promtail** (`app.kubernetes.io/name=promtail`), which ships logs and never scrapes :8000.
+  Prometheus runs on the hub and can't reach spoke pod IPs. That policy currently admits nothing useful;
+  delete it or scope it to a future spoke Prometheus.
+- `agentforge-allow-internal` still lets every `agentforge` pod (worker, Flower, Postgres, Redis) call the
+  gateway. Narrow it if only the worker needs to.
+- NetworkPolicy can't filter by path. Envoy is allowed on :8000; the HTTPRoute decides that only `/health`
+  and `/metrics` go there directly. Stripping identity headers on that rule (Q2 recommendation 2) still
+  applies.
+
+### 2. `--api-route=^/v1/` (done)
+
+Added to `platform/oauth2-proxy-agentforge/oauth2-proxy.yaml`. Every AgentForge API route is under `/v1/`
+(`agents`, `pipelines`, `jobs`, `search`). Results through the real gateway:
+
+| Request | Before | Now |
+| --- | --- | --- |
+| `GET /v1/agents`, no token | 302 → Keycloak login | **401** |
+| `GET /v1/agents`, invalid/expired bearer | 302 | **401** |
+| `GET /v1/agents`, valid bearer | 200 | 200 |
+| `GET /` (browser), no session | 302 | 302 (login still works) |
+
+`helmsman-sanity.sh` section K now checks the 401.
+
+### 3. Test users and their exact groups
+
+Created in Keycloak, recreated by `dev-up-gemini.sh` Stage 10.5 after a Keycloak restart (variable
+`AF_KC_USERS`), checked by sanity. Passwords are generated once and kept in `~/.helmsman-dev/` (mode 600).
+
+| User | Groups | `X-Forwarded-Groups` received (echo test) | Password file |
+| --- | --- | --- | --- |
+| `subhankar` | `/teams/dev-team` | `/teams/dev-team` | `keycloak-agentforge-user-password` |
+| `af-platform-user` | `/teams/platform-team` | `/teams/platform-team` | `keycloak-af-platform-user-password` |
+| `af-readonly-user` | `/teams/dev-team`, `/readonly` | `/teams/dev-team,/readonly` | `keycloak-af-readonly-user-password` |
+
+The other identity headers for each user: `X-Forwarded-Preferred-Username` = the username,
+`X-Forwarded-Email` = `<username>@helmsman.dev`, `X-Forwarded-User` = the Keycloak user ID (`sub`).
+A forged `X-Forwarded-Groups: /teams/admins` sent with each request was **overwritten**. All three users
+get 200 on `GET /v1/agents` through the gateway with an `agentforge-cli` bearer token. Fetch a token the same
+way as for subhankar ([above](#fetching-a-test-token-for-subhankar)), with the other username and password file.
+
+The readonly user is in a team **and** `/readonly`, so AgentForge can test "member of dev-team, but may not
+run agents" (an AgentForge decision; Helmsman only supplies the groups).
+
+### 4. Team groups (option A, implemented)
+
+Keycloak now has:
+
+```
+/readonly
+/teams
+  /teams/dev-team        ← was the top-level dev-team (moved; members kept)
+  /teams/platform-team   ← was the top-level platform-team (moved)
+```
+
+Both `agentforge-gateway` and `agentforge-cli` groups mappers now use **`full.path=true`**, so tokens and
+`X-Forwarded-Groups` carry full paths. No other Keycloak client uses a groups mapper, so nothing else
+changed. dev-up does the migration idempotently: it moves an old flat group under `/teams` if it finds
+one, creates missing groups otherwise, and re-aligns a mapper whose config has drifted.
+
+**Rule for AgentForge:** split `X-Forwarded-Groups` on `,`. Team = the **single** entry starting with
+`/teams/`, minus the prefix (`dev-team`). Reject the request (403) if there are zero or several. Roles are
+other top-level entries (`/readonly`). Never use position.
+
+Why A, not B or C: it needs no oauth2-proxy change and no JWT verification in the app, and it gives one
+unambiguous team per user. A new team is one Keycloak group under `/teams` (add it to `AF_KC_GROUPS` in dev-up
+so it survives a restart).
+
+### 5. Long runs and SSE: timeouts and buffering
+
+**Measured (before the fix):**
+
+| Path | 10 s | 20 s | 40 s | 70 s | 310 s | SSE (event every 1 s / 10 s) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Envoy → server (route default) | 200 | **504 at 15 s** | 504 at 15 s | 504 at 15 s | 504 at 15 s | events on time; **stream cut at 15 s** |
+| Envoy (route `timeouts.request: 360s`) → server | n/a | 200 | 200 | 200 | **200** | all events; cut at 360 s |
+| Envoy (360 s) → oauth2-proxy (default) → server | n/a | 200 | **502 at 30 s** | 502 at 30 s | 502 at 30 s | all events; cut at 360 s |
+| Envoy (360 s) → oauth2-proxy `--upstream-timeout=6m` → server | n/a | n/a | 200 | n/a | **200** | n/a |
+
+So there were **two limits**, and both blocked anything longer than 15 s, including today's synchronous
+`POST /v1/agents/{id}/run` and `POST /v1/pipelines/run` (they wait for the whole run before replying):
+
+1. **Envoy Gateway's default route timeout: 15 s**, applied to the whole request **including a stream**.
+   Fixed in the chart: `httproute.timeouts.request: 360s` on the authenticated rule
+   (`apps/agentforge/values.yaml`, `templates/httproute.yaml`).
+2. **oauth2-proxy `--upstream-timeout`, default 30 s.** It's the time to wait for the response to *start*,
+   so a stream that sends headers at once isn't affected, but a silent 5-minute run is. Fixed:
+   `--upstream-timeout=6m`.
+
+**Buffering: none.** Every SSE event arrived at the second it was sent, both directly and through oauth2-proxy
+(Go's reverse proxy flushes `text/event-stream` immediately; Envoy streams by default). No change was needed.
+
+**What AgentForge should know:**
+
+- Runs up to **6 minutes** now work as plain synchronous requests. Past that they get a 504.
+- **An SSE stream is capped at 360 s in total**, even while events flow, because Gateway API's
+  `timeouts.request` covers the whole exchange. For longer streams, raise `httproute.timeouts.request`
+  (and `--upstream-timeout` if the first byte can be late), or reconnect with `Last-Event-ID`.
+- Send an SSE comment (`: keepalive`) every 15–30 s anyway. It helps clients and any future proxies or load
+  balancers (for example an OCI or AWS load balancer's idle timeout, which is often 60 s).
+- Send `Cache-Control: no-cache` on SSE responses. If you ever add response compression, exclude
+  `text/event-stream`.
+- For long work, the async pattern (start job → 202 + job ID → poll `GET /v1/jobs/{id}` or stream it) avoids
+  all of this. `store_job` already exists in `pipelines.py`.
+
+### 6. Do the post-restart sanity checks call AgentForge agents?
+
+**Not agents, no.** Before this round, section K checked routing up to oauth2-proxy (`/ping` 200, login
+redirect to the current Keycloak) and that the pods were Ready, but never made an authenticated request to
+the AgentForge app. It now does that, without running an agent:
+
+| Check (section K) | What it proves |
+| --- | --- |
+| `GET /v1/agents`, no token → **401** | `--api-route` is active |
+| Password-grant token for `subhankar` via `agentforge-cli` | Keycloak, the realm, the client and the user survived the restart |
+| `GET /v1/agents` with that bearer → **200** | Envoy → oauth2-proxy (token validation against the current issuer) → AgentForge gateway → app, end to end |
+| Groups `/teams/dev-team`, `/teams/platform-team`, `/readonly`; each test user's exact groups; both mappers `full.path=true` | The team model survived the restart |
+
+`GET /v1/agents` is a static list: **no LLM call, no Groq quota used.** Running a real agent is
+deliberately **not** in sanity. It takes minutes, spends Groq tokens, and the free tier's 8,000 tokens/minute
+limit made phases 3–6 fail with 429s on 2026-10-30, which would make sanity flaky for reasons that aren't
+platform faults. The agent-level e2e (`scripts/test_e2e_phase*.py` inside the gateway pod) stays a separate,
+manual step after a restart
+([how it was run](troubleshooting/laptop-reboot-and-e2e-2026-10-30.md#agentforge-end-to-end-results)).
 
 ## Related changes this session
 

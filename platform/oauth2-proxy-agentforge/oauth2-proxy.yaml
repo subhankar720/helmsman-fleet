@@ -72,6 +72,15 @@ spec:
             # the agentforge-cli client). Validated against the OIDC issuer; the
             # token's aud must include agentforge-gateway (audience mapper).
             - --skip-jwt-bearer-tokens=true
+            # API clients get 401 instead of a 302 to the Keycloak login page
+            # when the token is missing, expired or invalid. Browser paths
+            # outside /v1/ still redirect.
+            - --api-route=^/v1/
+            # Default 30 s: a synchronous agent/pipeline run longer than that got
+            # 502. Matches the HTTPRoute request timeout (apps/agentforge,
+            # httproute.timeouts.request: 360s). Streams (SSE) aren't affected
+            # once headers are sent; the route timeout caps their total length.
+            - --upstream-timeout=6m
             - --skip-auth-route=^/health$
             - --skip-auth-route=^/metrics$
             - --skip-provider-button=true

@@ -28,13 +28,17 @@ spec:
           port: 8000
 
     # All authenticated traffic routes through the Helmsman oauth2-proxy.
-    # oauth2-proxy validates the Keycloak JWT, injects X-Auth-Request-* headers,
-    # then proxies to agentforge-gateway.agentforge.svc.cluster.local:8000.
+    # oauth2-proxy validates the Keycloak JWT, sets X-Forwarded-* identity
+    # headers, then proxies to agentforge-gateway.agentforge.svc.cluster.local:8000.
     # A ReferenceGrant in gateway-infra permits this cross-namespace reference.
     - matches:
         - path:
             type: PathPrefix
             value: /
+      {{- with .Values.httproute.timeouts }}
+      timeouts:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       backendRefs:
         - name: {{ .Values.httproute.oauth2Proxy.name }}
           namespace: {{ .Values.httproute.oauth2Proxy.namespace }}

@@ -819,6 +819,10 @@ header "K. AgentForge Platform (Envoy Gateway, oauth2-proxy, Keycloak, Vault)"
 # this section only reports.
 AF_FIX="dev-up-gemini.sh Stage 10.5 repairs this"
 AF_STATE_DIR="${HELMSMAN_STATE_DIR:-$HOME/.helmsman-dev}"
+# Must match dev-up-gemini.sh (AF_KC_GROUPS / AF_KC_USERS).
+AF_KC_GROUPS="/teams/dev-team /teams/platform-team /readonly"
+AF_KC_USERS="subhankar:/teams/dev-team af-platform-user:/teams/platform-team af-readonly-user:/teams/dev-team,/readonly"
+AF_KC_USERS_LIST=$(for s in $AF_KC_USERS; do printf '%s ' "${s%%:*}"; done)
 
 # --- Argo CD Applications (kubectl-applied — git alone can't recreate them) ---
 for APP in platform-envoy-gateway platform-envoy-gateway-infra platform-agentforge-oauth2proxy \
@@ -912,14 +916,27 @@ fi
 
 if [ -n "$GW_SVC" ]; then
     GW_URL="http://${GW_SVC}.envoy-gateway-system.svc.cluster.local"
+    # Authenticated API call as subhankar (agentforge-cli password grant →
+    # Bearer → oauth2-proxy → gateway). GET /v1/agents is a static list: no
+    # agent runs, no LLM call. The password goes in on stdin, not the pod spec.
+    AF_PW=$(cat "$AF_STATE_DIR/keycloak-agentforge-user-password" 2>/dev/null || echo "")
     for attempt in 1 2 3; do   # a throwaway probe pod can fail on its own; retry before reporting
         kubectl --context "$SPOKE_CONTEXT" -n default delete pod agentforge-gw-check --ignore-not-found > /dev/null 2>&1 || true
-        AF_E2E=$(kubectl --context "$SPOKE_CONTEXT" -n default run --quiet --rm -i --restart=Never agentforge-gw-check \
+        AF_E2E=$(printf '%s\n' "$AF_PW" | kubectl --context "$SPOKE_CONTEXT" -n default run --quiet --rm -i --restart=Never agentforge-gw-check \
             --image=curlimages/curl:latest -- sh -c "
+              read -r P
               curl -s -o /dev/null -w 'ping=%{http_code}\n' --max-time 5 -H 'Host: agentforge.helmsman.local' '${GW_URL}/ping'
               curl -s -o /dev/null -w 'start=%{http_code} %{redirect_url}\n' --max-time 5 -H 'Host: agentforge.helmsman.local' '${GW_URL}/oauth2/start'
+              curl -s -o /dev/null -w 'noauth=%{http_code}\n' --max-time 5 -H 'Host: agentforge.helmsman.local' '${GW_URL}/v1/agents'
+              T=\$(curl -s --max-time 10 'http://${HUB_IP}:30081/realms/helmsman/protocol/openid-connect/token' \
+                  -d grant_type=password -d client_id=agentforge-cli -d username=subhankar --data-urlencode \"password=\$P\" \
+                  | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p')
+              echo \"token=\${T:+yes}\"
+              [ -n \"\$T\" ] && curl -s -o /dev/null -w 'api=%{http_code}\n' --max-time 10 -H 'Host: agentforge.helmsman.local' \
+                  -H \"Authorization: Bearer \$T\" '${GW_URL}/v1/agents'
             " 2>/dev/null || echo "")
-        echo "$AF_E2E" | grep -q '^ping=200' && echo "$AF_E2E" | grep -q "^start=302 http://${HUB_IP}:30081/" && break
+        echo "$AF_E2E" | grep -q '^ping=200' && echo "$AF_E2E" | grep -q "^start=302 http://${HUB_IP}:30081/" \
+            && echo "$AF_E2E" | grep -q '^api=200' && break
         sleep 5
     done
     if echo "$AF_E2E" | grep -q '^ping=200'; then
@@ -931,6 +948,20 @@ if [ -n "$GW_SVC" ]; then
         ok "oauth2-proxy login redirects to current Keycloak (http://${HUB_IP}:30081/realms/helmsman)"
     else
         fail "oauth2-proxy login redirect is not the current Keycloak ($(echo "$AF_E2E" | grep '^start=' || echo 'no response')) — stale issuer; $AF_FIX"
+    fi
+    if echo "$AF_E2E" | grep -q '^noauth=401'; then
+        ok "Unauthenticated API call gets 401 (/v1/agents, --api-route)"
+    else
+        fail "Unauthenticated /v1/agents returned $(echo "$AF_E2E" | sed -n 's/^noauth=//p'), expected 401 — check oauth2-proxy --api-route"
+    fi
+    if [ -z "$AF_PW" ]; then
+        warn "No password in $AF_STATE_DIR/keycloak-agentforge-user-password — skipped the authenticated API check"
+    elif echo "$AF_E2E" | grep -q '^api=200'; then
+        ok "Authenticated API call as subhankar: Keycloak token → oauth2-proxy → AgentForge GET /v1/agents 200"
+    elif ! echo "$AF_E2E" | grep -q '^token=yes'; then
+        fail "Could not get a Keycloak token for subhankar via agentforge-cli — $AF_FIX"
+    else
+        fail "Bearer call to /v1/agents returned $(echo "$AF_E2E" | sed -n 's/^api=//p') — oauth2-proxy or the AgentForge gateway is unhealthy"
     fi
 else
     fail "No Envoy proxy Service for helmsman-gateway — cannot test the AgentForge route"
@@ -987,10 +1018,13 @@ KC_REPORT=$(docker exec "$HUB_CONTAINER" sh -c "
     CID=\$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients?clientId=agentforge-gateway\" | sed -n 's/^\\[{\"id\":\"\\([^\"]*\\)\".*/\\1/p')
     [ -n \"\$CID\" ] && echo \"SECRET \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients/\$CID/client-secret\")\"
     echo \"CLI \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients?clientId=agentforge-cli\")\"
-    echo \"GROUPS \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/groups\")\"
-    UID=\$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/users?exact=true&username=subhankar\" | sed -n 's/^\\[{\"id\":\"\\([^\"]*\\)\".*/\\1/p')
-    echo \"USER \$UID\"
-    [ -n \"\$UID\" ] && echo \"MEMBER \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/users/\$UID/groups\")\"
+    for P in ${AF_KC_GROUPS}; do
+        echo \"GP\$P \$(curl -s -o /dev/null -w %{http_code} --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/group-by-path\$P\")\"
+    done
+    for U in ${AF_KC_USERS_LIST}; do
+        ID=\$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/users?exact=true&username=\$U\" | sed -n 's/^\\[{\"id\":\"\\([^\"]*\\)\".*/\\1/p')
+        [ -n \"\$ID\" ] && echo \"MEMBER:\$U \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/users/\$ID/groups\")\"
+    done
 " 2>/dev/null || echo "")
 KC_CS_LIVE=$(kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get secret agentforge-oauth2-proxy-secret \
     -o jsonpath='{.data.client-secret}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
@@ -1000,7 +1034,8 @@ while IFS= read -r line; do
         WARN*) warn "${line#WARN } — $AF_FIX" ;;
         *)     fail "${line#FAIL } — $AF_FIX" ;;
     esac
-done < <(printf '%s\n' "$KC_REPORT" | VAULT_CS="$AF_VAULT_CS" K8S_CS="$KC_CS_LIVE" python3 -c '
+done < <(printf '%s\n' "$KC_REPORT" | VAULT_CS="$AF_VAULT_CS" K8S_CS="$KC_CS_LIVE" \
+    AF_KC_GROUPS="$AF_KC_GROUPS" AF_KC_USERS="$AF_KC_USERS" python3 -c '
 import json, os, sys
 r = {}
 for line in sys.stdin:
@@ -1019,10 +1054,11 @@ if not clients:
 else:
     c = clients[0]
     print("OK Keycloak client agentforge-gateway present (confidential=%s)" % (not c.get("publicClient")))
-    if any(m.get("protocolMapper") == "oidc-group-membership-mapper" for m in c.get("protocolMappers", [])):
-        print("OK Keycloak client agentforge-gateway has groups mapper")
+    gm = [m for m in c.get("protocolMappers", []) if m.get("protocolMapper") == "oidc-group-membership-mapper"]
+    if gm and gm[0].get("config", {}).get("full.path") == "true":
+        print("OK Keycloak client agentforge-gateway has groups mapper (full.path=true)")
     else:
-        print("FAIL Keycloak client agentforge-gateway has no groups mapper")
+        print("FAIL Keycloak client agentforge-gateway groups mapper %s" % ("has full.path=false (team paths missing)" if gm else "missing"))
     secret = (j("SECRET") or {}).get("value")
     vcs, kcs = os.environ.get("VAULT_CS"), os.environ.get("K8S_CS")
     if secret and secret == vcs == kcs:
@@ -1035,20 +1071,27 @@ cli = j("CLI")
 if not cli:
     print("FAIL Keycloak client agentforge-cli missing (CLI/SDK bearer tokens)")
 else:
-    kinds = {m.get("protocolMapper") for m in cli[0].get("protocolMappers", [])}
-    if {"oidc-group-membership-mapper", "oidc-audience-mapper"} <= kinds and cli[0].get("directAccessGrantsEnabled"):
-        print("OK Keycloak client agentforge-cli present (password grant, groups + audience mappers)")
+    ms = {m.get("protocolMapper"): m for m in cli[0].get("protocolMappers", [])}
+    fp = ms.get("oidc-group-membership-mapper", {}).get("config", {}).get("full.path")
+    if "oidc-audience-mapper" in ms and fp == "true" and cli[0].get("directAccessGrantsEnabled"):
+        print("OK Keycloak client agentforge-cli present (password grant, groups full.path + audience mappers)")
     else:
-        print("FAIL Keycloak client agentforge-cli is missing a mapper or password grant")
-names = {g["name"] for g in (j("GROUPS") or [])}
-for g in ("dev-team", "platform-team", "readonly"):
-    print(("OK Keycloak group %s present" if g in names else "FAIL Keycloak group %s missing") % g)
-if not r.get("USER"):
-    print("FAIL Keycloak user subhankar missing")
-else:
-    member = {g["name"] for g in (j("MEMBER") or [])}
-    print("OK Keycloak user subhankar is in dev-team" if "dev-team" in member
-          else "FAIL Keycloak user subhankar is not in dev-team")
+        print("FAIL Keycloak client agentforge-cli is missing a mapper, full.path=true or the password grant")
+for g in os.environ["AF_KC_GROUPS"].split():
+    print(("OK Keycloak group %s present" if r.get("GP" + g) == "200" else "FAIL Keycloak group %s missing") % g)
+for spec in os.environ["AF_KC_USERS"].split():
+    u, _, want = spec.partition(":")
+    m = j("MEMBER:" + u)
+    if not isinstance(m, list):
+        print("FAIL Keycloak user %s missing" % u)
+        continue
+    have, need = {g["path"] for g in m}, set(want.split(","))
+    if need <= have:
+        print("OK Keycloak user %s is in %s" % (u, want))
+    else:
+        print("FAIL Keycloak user %s is in %s, expected %s" % (u, ",".join(sorted(have)) or "no groups", want))
+    if have - need:
+        print("WARN Keycloak user %s is also in %s" % (u, ",".join(sorted(have - need))))
 ')
 
 # --- Platform namespaces must stay out of the Kyverno app policies ------------

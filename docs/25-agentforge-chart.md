@@ -29,7 +29,7 @@ renders 22 objects:
 | ExternalSecret | `agentforge-secrets` | from Vault `secret/agentforge/*` via ClusterSecretStore `vault-backend` |
 | Service | `agentforge-gateway` (8000), `-postgres` (5432), `-redis` (6379), `-flower` (5555) | |
 | ServiceAccount | `agentforge` | |
-| HTTPRoute | `agentforge` | host `agentforge.helmsman.local` on `gateway-infra/helmsman-gateway` |
+| HTTPRoute | `agentforge` | host `agentforge.helmsman.local` on `gateway-infra/helmsman-gateway`; authenticated rule has `timeouts.request: 360s` (`httproute.timeouts`; the Envoy Gateway default is 15 s) |
 | NetworkPolicy ×5 | `agentforge-deny-all`, `-allow-internal`, `-allow-ingress`, `-allow-prometheus`, `-allow-egress-external` | see [Network](#network) |
 
 `serviceMonitor.enabled: false` on the spoke, because Prometheus runs on the hub.
