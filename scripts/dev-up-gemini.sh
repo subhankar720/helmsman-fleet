@@ -1351,6 +1351,34 @@ try:
         else:
             print("OK: Keycloak client secret matches Vault")
 
+    # agentforge-cli: public client for the CLI/SDK. Password grant gives a
+    # token oauth2-proxy accepts as "Authorization: Bearer"
+    # (--skip-jwt-bearer-tokens): groups claim + aud must include
+    # agentforge-gateway (oauth2-proxy's client-id).
+    aud_mapper = {"name": "audience-agentforge-gateway", "protocol": "openid-connect",
+                  "protocolMapper": "oidc-audience-mapper", "consentRequired": False,
+                  "config": {"included.client.audience": cid, "id.token.claim": "true",
+                             "access.token.claim": "true"}}
+    cli = req("GET", realm + "/clients?clientId=agentforge-cli", token=T)[1]
+    if not cli:
+        st, _ = req("POST", realm + "/clients", {
+            "clientId": "agentforge-cli", "name": "AgentForge CLI / SDK", "enabled": True,
+            "protocol": "openid-connect", "publicClient": True, "standardFlowEnabled": False,
+            "implicitFlowEnabled": False, "directAccessGrantsEnabled": True,
+            "serviceAccountsEnabled": False, "protocolMappers": [mapper, aud_mapper]}, token=T)
+        print("OK: Keycloak client agentforge-cli was missing — created" if st == 201
+              else "ERR: Keycloak client agentforge-cli create failed (%s)" % st)
+        failed |= st != 201
+    else:
+        have = {m.get("protocolMapper") for m in cli[0].get("protocolMappers", [])}
+        for m in (mapper, aud_mapper):
+            if m["protocolMapper"] not in have:
+                st, _ = req("POST", "%s/clients/%s/protocol-mappers/models" % (realm, cli[0]["id"]), m, token=T)
+                print("OK: agentforge-cli %s mapper was missing — added" % m["name"] if st == 201
+                      else "ERR: agentforge-cli %s mapper add failed (%s)" % (m["name"], st))
+                failed |= st != 201
+        print("OK: Keycloak client agentforge-cli present with groups + audience mappers")
+
     # User + group membership
     uname = E["AF_KC_USER"]
     users = req("GET", realm + "/users?exact=true&username=" + urllib.parse.quote(uname), token=T)[1]

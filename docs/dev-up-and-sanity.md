@@ -86,7 +86,8 @@ silent for minutes).
    current hub IP; add any keys the AgentForge chart reads that are missing (`db`/`cache` generated,
    `llm`/`confluence` empty); write the backup.
 4. Keycloak (via port-forward on 18081): groups `dev-team`, `platform-team`, `readonly`; client
-   `agentforge-gateway` with the groups mapper and the **Vault** client secret; user `subhankar`
+   `agentforge-gateway` with the groups mapper and the **Vault** client secret; public client
+   `agentforge-cli` (password grant, groups + audience mappers) for CLI/SDK bearer tokens; user `subhankar`
    (first/last name and verified email, otherwise logins fail with "Account is not fully set up")
    in `dev-team`.
 5. Force-sync oauth2-proxy's ExternalSecret. Restart oauth2-proxy when the fingerprint of its
@@ -114,6 +115,12 @@ silent for minutes).
 
 Probe pods in `helmsman.dev/managed` namespaces are created with `probe_overrides` (managed-by label,
 non-root, limits, no privilege escalation), so Kyverno doesn't reject the checks themselves.
+
+## Related references
+
+- [25-agentforge-chart.md](25-agentforge-chart.md): the AgentForge chart as deployed, including the PostSync migrate Job and the ingest CronJob
+- [agentforge-identity-integration.md](agentforge-identity-integration.md): bearer tokens, `agentforge-cli`, issuer, trusted headers, NetworkPolicy test
+- [cloud-migration-inventory.md](cloud-migration-inventory.md): what changes for the Oracle Cloud A1 (arm64) move
 
 ## Incident history
 

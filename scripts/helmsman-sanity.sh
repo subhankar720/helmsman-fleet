@@ -986,6 +986,7 @@ KC_REPORT=$(docker exec "$HUB_CONTAINER" sh -c "
     echo \"CLIENT \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients?clientId=agentforge-gateway\")\"
     CID=\$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients?clientId=agentforge-gateway\" | sed -n 's/^\\[{\"id\":\"\\([^\"]*\\)\".*/\\1/p')
     [ -n \"\$CID\" ] && echo \"SECRET \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients/\$CID/client-secret\")\"
+    echo \"CLI \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients?clientId=agentforge-cli\")\"
     echo \"GROUPS \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/groups\")\"
     UID=\$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/users?exact=true&username=subhankar\" | sed -n 's/^\\[{\"id\":\"\\([^\"]*\\)\".*/\\1/p')
     echo \"USER \$UID\"
@@ -1030,6 +1031,15 @@ else:
         print("FAIL client secret mismatch (Keycloak=%s, Vault=%s, oauth2-proxy Secret=%s)" %
               tuple("set" if x else "missing" for x in (secret, vcs, kcs)) if not (secret and vcs and kcs)
               else "FAIL client secret differs between Keycloak, Vault and the oauth2-proxy Secret")
+cli = j("CLI")
+if not cli:
+    print("FAIL Keycloak client agentforge-cli missing (CLI/SDK bearer tokens)")
+else:
+    kinds = {m.get("protocolMapper") for m in cli[0].get("protocolMappers", [])}
+    if {"oidc-group-membership-mapper", "oidc-audience-mapper"} <= kinds and cli[0].get("directAccessGrantsEnabled"):
+        print("OK Keycloak client agentforge-cli present (password grant, groups + audience mappers)")
+    else:
+        print("FAIL Keycloak client agentforge-cli is missing a mapper or password grant")
 names = {g["name"] for g in (j("GROUPS") or [])}
 for g in ("dev-team", "platform-team", "readonly"):
     print(("OK Keycloak group %s present" if g in names else "FAIL Keycloak group %s missing") % g)
