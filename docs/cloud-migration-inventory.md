@@ -3,14 +3,29 @@
 Last updated: 2026-10-31
 
 This lists what has to change, be decided or be retested when Helmsman moves from the two local kind
-clusters to the cloud. The target, from `~/projects/helmsman/tools/oci-a1-grab.sh`, is an **Oracle Cloud
-Ampere A1 VM**: **aarch64 / arm64**, Always Free at 2 OCPU / 12 GB, 150 GB boot volume, Ubuntu 22.04.
+clusters to the cloud. **The cloud target isn't fixed yet.** Candidates:
+
+| Candidate | CPU architecture | Notes |
+| --- | --- | --- |
+| Oracle Cloud Ampere A1 (`~/projects/helmsman/tools/oci-a1-grab.sh`) | **arm64** | Always Free 2 OCPU / 12 GB, 150 GB boot volume, Ubuntu 22.04; capacity is hard to get |
+| AWS Graviton (t4g, m7g, …) | **arm64** | usually cheaper than the x86 equivalent |
+| AWS Intel/AMD (t3, m6i, …) | **amd64** | same architecture as the laptop |
+
+Because the target could be either architecture, **every image we build must be multi-arch
+(amd64 + arm64)**. See item 1.
+
+**Test on kind first.** Everything in this list that can be tested locally is tested on the laptop kind
+clusters before any cloud work. Note the one limit: the laptop is amd64, and its Docker can't run arm64
+images yet (`docker run --platform linux/arm64 alpine uname -m` → `exec format error`, checked
+2026-10-31). kind proves the amd64 build and every functional change. For arm64, the laptop can only
+smoke-test under QEMU (install it with `docker run --privileged --rm tonistiigi/binfmt --install arm64`);
+the real arm64 check needs an arm64 CI runner (`ubuntu-24.04-arm`) or the cloud VM itself.
 
 **Status values:** `open` (not started), `decided` (approach agreed, not done), `done`.
 
 | # | Item | Area | Owner | Status |
 | --- | --- | --- | --- | --- |
-| 1 | [Image architecture: AgentForge (and two other images) are amd64-only](#1-image-architecture-amd64-only-images) | Build | AgentForge team, Helmsman | open |
+| 1 | [Image architecture: AgentForge (and two other images) are amd64-only](#1-image-architecture-amd64-only-images) | Build | AgentForge team, Helmsman | decided (multi-arch) |
 | 2 | [Postgres `fsGroup` retest on a real block volume](#2-postgres-fsgroup-retest) | Storage | Helmsman | open |
 | 3 | [AgentForge egress rules](#3-agentforge-egress-rules) | Network | Helmsman + AgentForge team | open |
 | 4 | [Stable Keycloak issuer / hostname](#4-stable-keycloak-issuer-hostname) | Identity | Helmsman | open |
@@ -18,9 +33,11 @@ Ampere A1 VM**: **aarch64 / arm64**, Always Free at 2 OCPU / 12 GB, 150 GB boot 
 | 6 | [NetworkPolicy-capable CNI and ingress tightening](#6-cni-and-networkpolicy) | Network | Helmsman | open |
 | 7 | [Gateway exposure: NodePort to LoadBalancer/ingress, TLS](#7-gateway-exposure-and-tls) | Network | Helmsman | open |
 | 8 | [GHCR pull credentials](#8-ghcr-pull-credentials) | Build | Helmsman | open |
+| 9 | [Embedding model for semantic search (optional)](#9-embedding-model-for-semantic-search-optional) | App | AgentForge team | open |
 
 Items 1–3 were requested by the AgentForge team. Items 4–8 came out of the same investigation
-(see [agentforge-identity-integration.md](agentforge-identity-integration.md)).
+(see [agentforge-identity-integration.md](agentforge-identity-integration.md)). Item 9 came from the
+AgentForge plan's embedding-model decision.
 
 ## 1. Image architecture: amd64-only images
 
@@ -37,19 +54,30 @@ Every upstream image already has `linux/arm64`: Kubernetes, kindnet, Argo CD, Ke
 Envoy Gateway v1.3.1 / Envoy 1.33, Kyverno 1.13.4, ESO 0.10.7, oauth2-proxy 7.7.1, pgvector pg16,
 Redis 7, Flower 2.0, Loki, Promtail, Grafana and Prometheus.
 
+**Decision (2026-10-31): build every image multi-arch (linux/amd64 + linux/arm64).** The cloud target
+may be arm64 (Oracle A1, AWS Graviton) or amd64 (AWS x86). One multi-arch image covers all of them and
+the laptop: Kubernetes pulls the matching platform automatically, with no tag or chart changes.
+
 **What's needed:**
 
 - **AgentForge CI:** build multi-arch with `docker buildx build --platform linux/amd64,linux/arm64 --push`.
-  Check that every Python wheel in `requirements.txt` has an aarch64 build; anything compiled (asyncpg,
-  pgvector, tokenizers, numpy) must either have a wheel or build under QEMU.
+  Prefer native runners (`ubuntu-latest` for amd64, `ubuntu-24.04-arm` for arm64, merged into one manifest
+  list) over QEMU emulation, which is very slow for compiled Python packages. Check that every Python wheel
+  in `requirements.txt` has an aarch64 build; anything compiled (asyncpg, pgvector, tokenizers, numpy) must
+  either have a wheel or build on the arm64 runner.
 - **Cosign signing must cover the multi-arch index.** Kyverno's `verify-agentforge-signatures` verifies the
   digest the pod pulls. Sign the index digest (`cosign sign --recursive` signs the index and every
   per-platform manifest), and retest admission on arm64.
 - **`helmsman-app` and `helmsman-operator`:** same multi-arch build. The operator also has to be **pushed to
   a registry**, because the cloud has no `kind load docker-image`. Change `imagePullPolicy: Never`, which
   dev-up Stage 4.5 sets.
-- **Retest:** on an arm64 node, gateway, worker, migrate Job and ingest CronJob pods start, and the
-  [e2e phases](troubleshooting/laptop-reboot-and-e2e-2026-10-30.md#agentforge-end-to-end-results) pass.
+- **Retest, in this order:**
+  1. **kind (laptop, amd64):** redeploy from the multi-arch tag; Kyverno admits the signed index; the
+     [e2e phases](troubleshooting/laptop-reboot-and-e2e-2026-10-30.md#agentforge-end-to-end-results) pass.
+  2. **arm64 smoke test:** `docker buildx imagetools inspect` shows both platforms; the arm64 image starts
+     and imports its dependencies (QEMU on the laptop, or the arm64 CI runner).
+  3. **Cloud node (whichever architecture):** gateway, worker, migrate Job and ingest CronJob pods start,
+     and the e2e phases pass.
 
 ## 2. Postgres fsGroup retest
 
@@ -156,3 +184,32 @@ interactive `gh` login. GHCR rejects fine-grained PATs. For the cloud, use a ded
 GitHub App / machine-user token with `read:packages`. Store it in Vault and sync it with ESO into
 `agentforge` and `kyverno` (Kyverno uses it to verify signatures). Alternatively, make the images public if
 that's acceptable.
+
+## 9. Embedding model for semantic search (optional)
+
+**Current state.** IntelliSearch uses **Postgres full-text search** (`ts_rank` / `plainto_tsquery` in
+`agents/intellisearch/retriever.py`), so no embedding model is used today. The schema is already prepared:
+`document_chunks.embedding vector(1536)` (sized for OpenAI `text-embedding-3-small`) exists in
+`infra/sql/init.sql`, but it's empty, and the vector index is commented out. The ingest status reports
+`"search_backend":"postgresql_fulltext","phase7_upgrade":"pgvector_semantic_similarity"`.
+
+**An embedding model is only needed if AgentForge adopts semantic search.** Keyword search works without one.
+
+| Option | Runs where | Cost | Works the same on laptop and cloud? |
+| --- | --- | --- | --- |
+| **fastembed** (Qdrant; ONNX on CPU, in-pod) — *AgentForge recommendation* | inside gateway/ingest pods | free | yes: onnxruntime has amd64 and arm64 wheels (to verify) |
+| Ollama embeddings (e.g. `nomic-embed-text`) | Ollama on the laptop (`:11434`) | free | no: there's no Ollama in the cloud, and item 3 removes port 11434 |
+| OpenAI `text-embedding-3-small` | external API | paid, needs a key | yes, but adds an API key, egress to `api.openai.com`, and a per-call cost |
+
+**If fastembed is chosen:**
+
+- **Dimension change.** fastembed's common models produce 384 dimensions (`BAAI/bge-small-en-v1.5`) or 768,
+  not 1536. Change the column to `vector(<dim>)` while it's still empty (an idempotent migration in
+  `init.sql`, so the PostSync migrate Job applies it), then enable the vector index.
+- **Bake the model into the image.** fastembed downloads the model from Hugging Face on first use. Download
+  it at build time (an image layer of roughly 100–200 MB) so pods don't need egress to `huggingface.co`, which
+  item 3's tightened rules wouldn't allow.
+- **Memory.** Embedding on CPU adds memory to the gateway (for queries) and the ingest job (for 1,614+
+  chunks). Re-check the resource limits, especially on a 12 GB single-node cloud VM.
+- **Test order** (the same as item 1): kind on the laptop first (ingest re-run, embeddings populated,
+  semantic queries return sensible results, e2e passes), then arm64 under QEMU or CI, then the cloud node.
