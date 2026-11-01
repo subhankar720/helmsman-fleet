@@ -23,8 +23,9 @@ spec:
         key: agentforge/auth
         property: cookie_secret
 ---
-# oauth2-proxy Deployment — validates Keycloak JWTs, injects X-Auth-Request-*
-# headers, proxies authenticated requests to the AgentForge gateway service.
+# oauth2-proxy Deployment — validates Keycloak logins and bearer JWTs, sets
+# X-Forwarded-{User,Email,Groups,Preferred-Username}, proxies authenticated
+# requests to the AgentForge gateway service.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

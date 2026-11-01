@@ -10,8 +10,10 @@ The AgentForge onboarding added these:
 - Envoy Gateway v1.3.1 on the spoke, GatewayClass `envoy`, `gateway-infra/helmsman-gateway`
 - Keycloak client `agentforge-gateway` with a groups mapper, groups `dev-team` /
   `platform-team` / `readonly`, user `subhankar` in `dev-team`
-- oauth2-proxy in `gateway-infra`, which validates Keycloak logins, injects `X-Auth-Request-*`
-  headers and proxies to AgentForge
+- oauth2-proxy in `gateway-infra`, which validates Keycloak logins, sets the `X-Forwarded-*` identity
+  headers and proxies to AgentForge (corrected 2026-11-01: an earlier version said `X-Auth-Request-*`,
+  which oauth2-proxy never sends upstream; see
+  [agentforge-identity-integration.md](../agentforge-identity-integration.md#q4-header-format-ordering-and-a-dedicated-team-claim))
 - Vault `secret/agentforge/{auth,llm,db,cache,confluence}`
 - Kyverno `verify-agentforge-signatures` on the spoke
 - `ghcr-pull-secret` and the `helmsman.dev/managed=true` label on the `agentforge` namespace
