@@ -1,0 +1,50 @@
+{{- /*
+  REPLACES the two policies `agentforge-allow-ingress` and `agentforge-allow-prometheus`
+  in templates/networkpolicies.yaml (delete both old blocks, paste this in).
+
+  Why: the app will trust the X-Forwarded-User / -Groups headers. Today the policy admits EVERY pod in
+  gateway-infra, envoy-gateway-system and monitoring, and a pod in gateway-infra that sent a forged
+  X-Forwarded-Groups got 200 (platform test, 2026-10-31). Admit only the two real callers.
+
+  Labels (platform team, 2026-10-31). Never use pod-template-hash or the hashed Envoy Deployment name.
+  Both selectors sit in ONE `from` entry, so they are ANDed.
+*/ -}}
+{{- if .Values.networkPolicies.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agentforge-allow-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: agentforge-gateway
+  policyTypes: [Ingress]
+  ingress:
+    # oauth2-proxy: every authenticated path
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gateway-infra
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: agentforge-oauth2-proxy
+        # Envoy data plane: only the HTTPRoute's exact /health and /metrics rule reaches the gateway directly
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: envoy-gateway-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: envoy
+              app.kubernetes.io/component: proxy
+              gateway.envoyproxy.io/owning-gateway-name: helmsman-gateway
+              gateway.envoyproxy.io/owning-gateway-namespace: gateway-infra
+      ports:
+        - port: 8000
+          protocol: TCP
+{{- end }}
+# `agentforge-allow-prometheus` is intentionally gone: on the spoke the `monitoring` namespace holds only
+# Promtail (it ships logs and never scrapes :8000), and Prometheus runs on the hub. Re-add a policy scoped to
+# the real scraper when a spoke-side metrics path exists.
