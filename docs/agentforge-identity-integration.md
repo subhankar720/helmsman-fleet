@@ -157,7 +157,8 @@ the app ignores identity headers (`gateway/api/routes/agents.py`: `team_id = "de
 auth middleware`). Once AgentForge trusts `X-Forwarded-Groups`, **any pod in those four namespaces could
 impersonate any group.**
 
-**Recommendations, needed before trusting headers:**
+**Recommendations, needed before trusting headers:** (1 and 3 done on 2026-11-01, see the
+[narrowed policy](#2026-11-01-narrowed-ingress-policy-merged-and-tested); 2 and 4 still open)
 
 1. Narrow `agentforge-allow-ingress` from the whole `gateway-infra` namespace to the oauth2-proxy pods:
    `namespaceSelector: gateway-infra` **and** `podSelector: app.kubernetes.io/name=agentforge-oauth2-proxy`.
@@ -330,6 +331,36 @@ Things to know when writing it:
 - NetworkPolicy can't filter by path. Envoy is allowed on :8000; the HTTPRoute decides that only `/health`
   and `/metrics` go there directly. Stripping identity headers on that rule (Q2 recommendation 2) still
   applies.
+
+### 2026-11-01: narrowed ingress policy, merged and tested
+
+The AgentForge team's patch (`agentforge-networkpolicy-patch.tar.gz`) was merged into the fleet chart in
+`cd616d1`: `apps/agentforge/templates/networkpolicies-narrowed.yaml` replaces `agentforge-allow-ingress` with the
+rule above, and `agentforge-allow-prometheus` is deleted. Argo CD synced and pruned it.
+
+**The patch's `test_forged_headers.sh` always passed, even before the fix.** `kubectl run --rm` prints
+`pod "…" deleted` on the same output line as curl's status code, so the comparison with `"200"` never
+matched. On the unnarrowed policy it printed `BLOCKED` for three namespaces that actually returned 200. A
+probe pod that failed to start was also counted as BLOCKED. A fixed copy is in the AgentForge repo,
+`scripts/test_forged_headers.sh` (not committed there). It extracts the status code, reports a pod that
+never ran as INCONCLUSIVE, and adds a control probe that must get through.
+
+| Probe (forged `X-Forwarded-User` / `-Groups`, straight to gateway:8000) | Before (fixed script) | After |
+| --- | --- | --- |
+| pod in `default` | blocked | **blocked** |
+| pod in `gateway-infra` | **200** | **blocked** |
+| pod in `envoy-gateway-system` | **200** | **blocked** |
+| pod in `monitoring` | **200** | **blocked** |
+| control: pod in `gateway-infra` labelled `app.kubernetes.io/name=agentforge-oauth2-proxy` | 200 | 200 |
+
+The real paths still work after the change: Envoy → `/health` 200, `/v1/agents` without a token 401, with a
+bearer token via oauth2-proxy 200. `verify_phase7.sh` (`RUN_AGENT=0 NP_TEST=1`) agrees: section 10 `/health` 200,
+`/v1/agents` 401, and section 11 shows `default` blocked from Redis and the gateway. (`/metrics` through Envoy
+returns 404 from the app itself: AgentForge has no `/metrics` endpoint yet.)
+
+**What the control shows:** the policy trusts **labels**. Anyone who can create a pod in `gateway-infra`
+with the oauth2-proxy label gets in. Limit who can create pods in `gateway-infra` and `envoy-gateway-system`
+(RBAC; a Kyverno rule could also reserve those labels for their real Deployments).
 
 ### 2. `--api-route=^/v1/` (done)
 

@@ -30,7 +30,7 @@ renders 22 objects:
 | Service | `agentforge-gateway` (8000), `-postgres` (5432), `-redis` (6379), `-flower` (5555) | |
 | ServiceAccount | `agentforge` | |
 | HTTPRoute | `agentforge` | host `agentforge.helmsman.local` on `gateway-infra/helmsman-gateway`; authenticated rule has `timeouts.request: 360s` (`httproute.timeouts`; the Envoy Gateway default is 15 s) |
-| NetworkPolicy ×5 | `agentforge-deny-all`, `-allow-internal`, `-allow-ingress`, `-allow-prometheus`, `-allow-egress-external` | see [Network](#network) |
+| NetworkPolicy ×4 | `agentforge-deny-all`, `-allow-internal`, `-allow-ingress` (in `networkpolicies-narrowed.yaml`), `-allow-egress-external` | see [Network](#network) |
 
 `serviceMonitor.enabled: false` on the spoke, because Prometheus runs on the hub.
 
@@ -155,12 +155,15 @@ upstream and is forgeable**. See [agentforge-identity-integration.md](agentforge
 | --- | --- |
 | `agentforge-deny-all` | default deny, ingress and egress, all pods |
 | `agentforge-allow-internal` | all traffic between pods in `agentforge` |
-| `agentforge-allow-ingress` | gateway:8000 from **all pods** in `gateway-infra` and `envoy-gateway-system` |
-| `agentforge-allow-prometheus` | gateway:8000 from **all pods** in `monitoring` |
+| `agentforge-allow-ingress` | gateway:8000 **only** from pods labelled `app.kubernetes.io/name=agentforge-oauth2-proxy` in `gateway-infra`, and the `helmsman-gateway` Envoy proxy pods in `envoy-gateway-system` (narrowed 2026-11-01, `cd616d1`) |
 | `agentforge-allow-egress-external` | all pods → **any** destination on 53/UDP, 443, 30081, 30082, 11434 |
 
-The negative test on 2026-10-31 showed `default` and `sample-app` blocked, and the four allowed
-namespaces reachable. The recommended tightening is in
+`agentforge-allow-prometheus` was removed on 2026-11-01: the spoke's `monitoring` namespace holds only Promtail,
+which never scrapes :8000.
+
+The negative test on 2026-10-31 showed `default` and `sample-app` blocked, and four namespaces reachable.
+After narrowing (2026-11-01), AgentForge's `scripts/test_forged_headers.sh` shows `default`, `gateway-infra`,
+`envoy-gateway-system` and `monitoring` all **blocked**. The remaining tightening (internal traffic, egress) is in
 [identity Q2](agentforge-identity-integration.md#q2-cni-and-the-networkpolicy-negative-test) and
 [cloud inventory #3](cloud-migration-inventory.md#3-agentforge-egress-rules).
 

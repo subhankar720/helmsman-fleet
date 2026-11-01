@@ -166,8 +166,9 @@ kindnet enforces NetworkPolicy, and the
 [negative test](agentforge-identity-integration.md#q2-cni-and-the-networkpolicy-negative-test) passed.
 It needed a CPU-limit fix to be reliable, and it has no FQDN rules. On the cloud, choose a CNI with solid
 policy support (Cilium recommended, for FQDN egress and Hubble flow visibility). Before AgentForge trusts
-`X-Forwarded-Groups`, narrow `agentforge-allow-ingress` to the oauth2-proxy and Envoy pods (it currently
-allows whole namespaces).
+`X-Forwarded-Groups`, `agentforge-allow-ingress` had to be narrowed to the oauth2-proxy and Envoy pods. **Done on
+kind on 2026-11-01** (`cd616d1`); re-run `test_forged_headers.sh` on the cloud CNI, since label-based
+selection must behave the same there.
 
 ## 7. Gateway exposure and TLS
 
