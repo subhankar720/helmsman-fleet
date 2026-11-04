@@ -354,6 +354,11 @@ EOF
                   "$TMP_FLEET"/platform/kyverno/policies/argocd-application.yaml \
                   "$TMP_FLEET"/platform/envoy-gateway/spoke-application.yaml \
                   "$TMP_FLEET"/apps/*/argocd-application.yaml; do
+    # The operator Application is for cloud environments only; on kind the
+    # operator is deployed by Stage 4.5 and must never be Argo-managed.
+    case "$app_file" in
+      */platform/helmsman-operator/*) log_info "Skipped (cloud only): $app_file"; continue ;;
+    esac
     if [ -f "$app_file" ]; then
       kubectl --context "$HUB_CTX" apply -f "$app_file"
       log_ok "Applied: $app_file"
@@ -637,7 +642,8 @@ if [ -f "$OPERATOR_DIR/Dockerfile" ] && [ -d "$OPERATOR_DIR/config/default" ]; t
     log_ok "CRDs and RBAC generated" || log_warn "make manifests failed"
 
   if [ -x "$OPERATOR_DIR/bin/kustomize" ]; then
-    if (cd "$OPERATOR_DIR" && ./bin/kustomize build config/default) > "$OPERATOR_MANIFESTS" 2>/dev/null; then
+    # config/overlays/kind sets image helmsman-operator:dev (no sed rewriting)
+    if (cd "$OPERATOR_DIR" && ./bin/kustomize build config/overlays/kind) > "$OPERATOR_MANIFESTS" 2>/dev/null; then
       log_ok "Manifests built via kustomize ($(wc -l < "$OPERATOR_MANIFESTS") lines)"
     else
       log_warn "kustomize build failed"
@@ -647,8 +653,6 @@ if [ -f "$OPERATOR_DIR/Dockerfile" ] && [ -d "$OPERATOR_DIR/config/default" ]; t
   fi
 
   if [ -s "$OPERATOR_MANIFESTS" ]; then
-    sed -i 's|image: controller:latest|image: helmsman-operator:dev|g' "$OPERATOR_MANIFESTS"
-    sed -i 's|image: ghcr.io/subhankar720/helmsman-operator:latest|image: helmsman-operator:dev|g' "$OPERATOR_MANIFESTS"
     kubectl --context "$SPOKE_CTX" apply -f "$OPERATOR_MANIFESTS" > /dev/null 2>&1 && \
       log_ok "Operator manifests applied to Spoke" || log_warn "Operator manifest apply failed"
   fi
