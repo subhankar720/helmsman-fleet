@@ -1,0 +1,34 @@
+# Argo CD Application for the Helmsman operator in CLOUD environments only.
+#
+# DO NOT APPLY TO THE KIND SPOKE. On kind the operator is built locally and
+# deployed by scripts/dev-up-gemini.sh (Stage 4.5); this file is explicitly
+# excluded from dev-up's Stage R7 platform glob. Nothing in this repo
+# (ApplicationSet, app-of-apps) picks it up automatically.
+#
+# targetRevision and kustomize.images are placeholders. helmsman-operator's
+# .github/workflows/ci-image.yml (job fleet-bump) rewrites them to the
+# operator commit SHA and controller=ghcr.io/subhankar720/helmsman-operator:<SHA>.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-helmsman-operator
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/subhankar720/helmsman-operator.git
+    targetRevision: PLACEHOLDER_OPERATOR_COMMIT_SHA
+    path: config/overlays/cloud
+    kustomize:
+      images:
+      - controller=ghcr.io/subhankar720/helmsman-operator:PLACEHOLDER_OPERATOR_COMMIT_SHA
+  destination:
+    name: helmsman-onprem
+    namespace: helmsman-operator-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+    - ServerSideApply=true
