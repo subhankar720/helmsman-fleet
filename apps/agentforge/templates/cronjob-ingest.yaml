@@ -10,6 +10,9 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "agentforge.labels" . | nindent 4 }}
+  annotations:
+    # PWP-1 item 1.2: after the migration (wave 1) has succeeded
+    argocd.argoproj.io/sync-wave: "2"
 spec:
   schedule: {{ .Values.ingest.schedule | default "0 2 * * *" | quote }}
   suspend: {{ ne (toString .Values.ingest.suspend) "false" }}

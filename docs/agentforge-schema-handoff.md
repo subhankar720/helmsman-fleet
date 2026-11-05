@@ -7,7 +7,7 @@ spoke, who does each step, how success is checked and reported, and how to roll 
 |---|---|
 | **Source of truth** | `infra/sql/init.sql` in `github.com/subhankar720/agentforge` (branch `main`) |
 | **Copy deployed** | `apps/agentforge/files/init.sql` in this repo (`helmsman-fleet`) |
-| **How it is applied** | ConfigMap `agentforge-postgres-init` (from `files/init.sql`) → Job `agentforge-db-migrate` (`psql -v ON_ERROR_STOP=1 -f /sql/init.sql`), an Argo CD hook of Application `agentforge` |
+| **How it is applied** | ConfigMap `agentforge-postgres-init` (from `files/init.sql`) → Job `agentforge-db-migrate` (`psql -v ON_ERROR_STOP=1 -f /sql/init.sql`), an Argo CD **Sync-phase hook in wave 1** of Application `agentforge`: after Postgres/Redis (wave 0) are Healthy, before gateway/worker/Flower/ingest (wave 2) are applied (PWP-1 item 1.2) |
 | **When it runs** | Only when Argo CD performs a **sync operation** of `agentforge`, i.e. after a commit that changes the rendered chart. A refresh with nothing to sync does not run it. |
 | **Owner of the copy** | The Helmsman platform side (whoever operates `helmsman-fleet`; today the Helmsman chat via Claude Code). AgentForge owns the SQL. |
 | **Interim** | Manual copy until AgentForge CI opens the PR automatically (a later work order). |
@@ -20,9 +20,10 @@ spoke, who does each step, how success is checked and reported, and how to roll 
 2. **Additive only** (new tables, new nullable columns, new indexes). `DROP`, `RENAME` and type changes
    need a separate, explicitly agreed plan: `git revert` of the copy does **not** undo SQL that has
    already run (see Rollback).
-3. **Code that needs a new column ships after the column exists.** Until PWP-1 item 1.2 lands, the
-   migration runs *after* new pods roll (PostSync), so the schema change must be merged and verified
-   *before* the code change. Once 1.2 is done, both can ship in one commit (this document is updated then).
+3. **Schema and code can ship in one commit** (since PWP-1 item 1.2). The migration runs in wave 1, before
+   wave 2 rolls the gateway and worker, so new pods start against the new schema. If the migration fails,
+   wave 2 is not applied and the old pods keep serving. The SQL must still be backward compatible with the
+   *old* code for the minutes the migration runs (additive only, rule 2).
 
 ## Procedure
 
@@ -94,9 +95,11 @@ kubectl $S -n agentforge get pods
 Success = revision is the new commit, `Synced Healthy Succeeded`, Job `succeeded=1` with no `ERROR` lines,
 the object exists in `\d`, all pods Ready.
 
-If the Job fails: the Job retries its pod up to `backoffLimit: 6`, then the hook and the sync operation are
-marked Failed. No sync `retry` policy is configured on `agentforge`, so do not expect Argo CD to re-run the
-same commit by itself (not yet observed on this app). Capture `kubectl logs` immediately and go to Rollback.
+If the Job fails: the Job retries its pod up to `backoffLimit: 6`; the hook then fails and the sync
+operation is retried by Argo CD **5 times** on its own (observed on the WO-P1.B synthetic app with the same
+sync settings, about 6.5 minutes, no `retry` block configured) before it ends `Failed`. Wave 2 is never
+applied, so the gateway/worker/Flower/ingest keep their previous spec and the old pods keep serving.
+Capture `kubectl logs` immediately (each retry recreates the Job) and go to Rollback.
 
 ### 6. Report back to AgentForge
 One message:

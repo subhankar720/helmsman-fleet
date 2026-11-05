@@ -21,7 +21,7 @@ renders 22 objects:
 | Deployment | `agentforge-flower` | Celery UI (`mher/flower:2.0`), port 5555 |
 | StatefulSet | `agentforge-postgres` | `pgvector/pgvector:pg16`, 5 Gi PVC, `runAsUser/fsGroup 999` |
 | StatefulSet | `agentforge-redis` | `redis:7-alpine`, 1 Gi PVC; Celery broker (`/0`) and results (`/1`) |
-| **Job (Argo CD PostSync hook)** | **`agentforge-db-migrate`** | re-applies `files/init.sql` after every sync ([below](#postsync-migration-job-agentforge-db-migrate)) |
+| **Job (Argo CD Sync hook, wave 1)** | **`agentforge-db-migrate`** | re-applies `files/init.sql` on every sync, after Postgres and before the app ([below](#migration-job-agentforge-db-migrate)) |
 | **CronJob** | **`agentforge-ingest`** | re-indexes Confluence into `document_chunks` ([below](#ingest-cronjob-agentforge-ingest)) |
 | ConfigMap | `agentforge-config` | non-secret env (model backend, env, log level, auth, HITL, Ollama URL, Confluence space/ancestor, **`CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND`**) |
 | ConfigMap | `agentforge-postgres-init` | `init.sql` from `files/init.sql`, mounted at `/docker-entrypoint-initdb.d` and by the migrate Job |
@@ -34,7 +34,7 @@ renders 22 objects:
 
 `serviceMonitor.enabled: false` on the spoke, because Prometheus runs on the hub.
 
-## PostSync migration Job: `agentforge-db-migrate`
+## Migration Job: `agentforge-db-migrate`
 
 **Why it exists.** Postgres runs `/docker-entrypoint-initdb.d/*.sql` **only when its data directory is
 empty**. The 2026-10-24 deployment hit exactly that: the app queried `audit_runs`, but the original init
@@ -45,7 +45,7 @@ databases.
 | Field | Value |
 | --- | --- |
 | Enabled by | `migrations.enabled: true` (`values.yaml`) |
-| Argo CD hook | `argocd.argoproj.io/hook: PostSync`. Runs **after every successful sync** of `agentforge`. |
+| Argo CD hook | `argocd.argoproj.io/hook: Sync`, `sync-wave: "1"` (since PWP-1 item 1.2; was PostSync). Wave 0 = Postgres, Redis and all non-workload objects; wave 1 = this Job; wave 2 = gateway, worker, Flower, ingest CronJob. Runs on **every sync operation** of `agentforge`. |
 | Hook delete policy | `BeforeHookCreation`: the previous run's Job is deleted when the next sync creates a new one |
 | `ttlSecondsAfterFinished` | `600`, so a finished Job disappears after 10 minutes. Not finding it in `kubectl get jobs` is normal. |
 | `backoffLimit` / `restartPolicy` | `6` / `OnFailure` |
@@ -71,7 +71,7 @@ team_quotas`. The gateway logs no more `UndefinedTable` errors.
 ```bash
 # see the hook result of the last sync
 argocd app get agentforge --server localhost:9091 --insecure | grep -i migrate
-# re-run the migration without changing git: any sync re-runs the PostSync hook
+# re-run the migration without changing git: any sync re-runs the hook
 argocd app sync agentforge --server localhost:9091 --insecure
 # watch it (within 10 min of the sync, before the TTL removes it)
 kubectl --context kind-helmsman-onprem -n agentforge logs -f job/agentforge-db-migrate
@@ -80,8 +80,9 @@ kubectl --context kind-helmsman-onprem -n agentforge exec agentforge-postgres-0 
   psql -U agentforge -d agentforge -c '\dt'
 ```
 
-If the Job fails, the **sync still shows Succeeded** for the main resources, but the hook shows Failed, and
-the app may run against an old schema. Check `argocd app get agentforge` after schema changes.
+If the Job fails, the **sync fails** and wave 2 is not applied: the gateway, worker and Flower keep their
+previous spec and pods (proven on a synthetic chart in WO-P1.B). Argo CD retries the failed sync on its own
+(5 times observed) before giving up. See [schema handoff](agentforge-schema-handoff.md) for verification and rollback.
 
 ## Ingest CronJob: `agentforge-ingest`
 
@@ -175,3 +176,4 @@ After narrowing (2026-11-01), AgentForge's `scripts/test_forged_headers.sh` show
 | 2026-10-25 | gh OAuth pull token; worker `--app` flag; Celery broker URLs; `--skip-provider-button` | same |
 | 2026-10-26 | Gateway readiness probe → `/health` (`d7df8b1`); `/health/ready` no longer unauthenticated; anchored skip routes (`47aeb2c`); **Phase 7: `init.sql`, PostSync migrate Job, ingest CronJob** (`6d2ad79`) | this doc |
 | 2026-10-31 | Bearer tokens (`--skip-jwt-bearer-tokens`), `--pass-access-token=false`, `agentforge-cli` client | [identity](agentforge-identity-integration.md) |
+| 2026-11-05 | PWP-1 1.2: migration Job PostSync → Sync hook in wave 1; Postgres/Redis wave 0; gateway/worker/Flower/ingest wave 2 (WO-P1.B) | [schema handoff](agentforge-schema-handoff.md) |

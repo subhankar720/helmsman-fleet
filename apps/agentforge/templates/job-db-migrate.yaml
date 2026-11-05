@@ -1,8 +1,13 @@
 {{- if (.Values.migrations | default dict).enabled }}
-# Re-applies files/init.sql after every sync. The script is idempotent
+# Re-applies files/init.sql on every sync. The script is idempotent
 # (CREATE ... IF NOT EXISTS, ON CONFLICT DO NOTHING). Postgres only runs
 # /docker-entrypoint-initdb.d on an EMPTY data dir, so without this job a schema
 # change would never reach an existing cluster.
+# PWP-1 item 1.2: a Sync-phase hook in wave 1 — after Postgres/Redis (wave 0) are
+# Healthy and before gateway/worker/Flower/ingest (wave 2) are applied. If it fails,
+# the sync fails and wave 2 is not applied, so the old pods keep serving. Not
+# PreSync: on a fresh install Postgres would not exist yet. BeforeHookCreation
+# because Jobs are immutable and the hook is recreated on every sync.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -11,8 +16,9 @@ metadata:
   labels:
     {{- include "agentforge.labels" . | nindent 4 }}
   annotations:
-    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook: Sync
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
 spec:
   backoffLimit: 6
   ttlSecondsAfterFinished: 600

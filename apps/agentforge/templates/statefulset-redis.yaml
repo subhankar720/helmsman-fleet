@@ -5,6 +5,9 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "agentforge.labels" . | nindent 4 }}
+  annotations:
+    # PWP-1 item 1.2: with Postgres, before the migration and the app
+    argocd.argoproj.io/sync-wave: "0"
 spec:
   serviceName: agentforge-redis
   replicas: 1
