@@ -15,9 +15,6 @@ spec:
       app.kubernetes.io/name: agentforge-worker
   template:
     metadata:
-      annotations:
-        # WO-P1.B sync-wave test (PWP-1 item 1.2): forces a roll so the order can be observed; reverted after.
-        helmsman.dev/wo-p1b-wave-test: "wo_p1b_wave_test column"
       labels:
         {{- include "agentforge.labels" . | nindent 8 }}
         app.kubernetes.io/name: agentforge-worker
