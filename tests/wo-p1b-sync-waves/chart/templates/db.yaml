@@ -1,0 +1,58 @@
+# Wave 0 — the "database". An in-memory HTTP service standing in for Postgres: GET /schema returns the
+# schema version the last migration wrote; PUT /schema?v=<x> is what the migration calls. It turns Ready
+# only after dbReadyDelaySeconds, so the waves visibly wait for it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wo-p1b-db
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  selector: {app: wo-p1b-db}
+  ports: [{port: 8080, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: wo-p1b-db
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  serviceName: wo-p1b-db
+  replicas: 1
+  selector: {matchLabels: {app: wo-p1b-db}}
+  template:
+    metadata:
+      labels: {app: wo-p1b-db}
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: db
+          image: {{ .Values.image }}
+          command: ["python3", "-u", "-c"]
+          args:
+            - |
+              import json, time
+              from http.server import BaseHTTPRequestHandler, HTTPServer
+              from urllib.parse import urlparse, parse_qs
+              state = {"version": None, "migrated_at": None}
+              class H(BaseHTTPRequestHandler):
+                  def _send(self, code, body):
+                      b = json.dumps(body).encode(); self.send_response(code)
+                      self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+                  def do_GET(self): self._send(200, state)
+                  def do_PUT(self):
+                      v = parse_qs(urlparse(self.path).query).get("v", [None])[0]
+                      state.update(version=v, migrated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+                      print("db: schema set to", v, "at", state["migrated_at"]); self._send(200, state)
+                  def log_message(self, *a): pass
+              print("db: started", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+              HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+          ports: [{containerPort: 8080}]
+          readinessProbe:
+            tcpSocket: {port: 8080}
+            initialDelaySeconds: {{ .Values.dbReadyDelaySeconds }}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {cpu: 200m, memory: 64Mi}
