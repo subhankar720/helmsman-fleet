@@ -92,3 +92,7 @@ COMMENT ON TABLE audit_runs IS
   'Immutable audit trail. No UPDATE or DELETE in production.';
 COMMENT ON TABLE document_chunks IS
   'IntelliSearch knowledge base. Populated by ingestion pipeline (Phase 6).';
+
+-- WO-P1.B sync-wave test (PWP-1 item 1.2): harmless nullable column; the copy is reverted afterwards
+-- (the column stays: a revert does not drop it, see docs/agentforge-schema-handoff.md).
+ALTER TABLE team_quotas ADD COLUMN IF NOT EXISTS wo_p1b_wave_test text;
