@@ -1,8 +1,0 @@
-apiVersion: v2
-name: wo-p1b-sync-waves
-description: >-
-  WO-P1.B scratch chart (PWP-1 item 1.2). Proves Argo CD sync-wave ordering for
-  "database first, then migration, then app" on fresh install, upgrade and a failing
-  migration. Not a workload; removed after the work order.
-type: application
-version: 0.1.0

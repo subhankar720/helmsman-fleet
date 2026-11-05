@@ -1,6 +1,0 @@
-# Driven by Helm parameters on the scratch Argo CD Application (no git change per case).
-schemaVersion: v1        # what the migration writes; the app pods record what they saw at start
-migration:
-  fail: false            # true → the migration exits 1 (failure-semantics case)
-image: python:3.12-alpine
-dbReadyDelaySeconds: 15  # the "database" becomes Ready only after this, to make ordering visible
