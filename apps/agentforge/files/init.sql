@@ -1,3 +1,4 @@
+-- schema-handoff dry run 2026-11-05 (WO-P1.B, PWP-1 item 1.3): comment-only change, no SQL change.
 -- AgentForge — Postgres Initialisation
 -- Phase 0: Core tables only
 -- Phase 1: Audit trail table added
