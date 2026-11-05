@@ -881,6 +881,60 @@ else
     fail "HTTPRoute agentforge/agentforge not healthy (${ROUTE_STATUS:-not found}) — synced by the agentforge Application"
 fi
 
+# Platform contract (PWP-1 item 1.1, doc 33): /health and /metrics go from Envoy straight to the
+# gateway, bypassing oauth2-proxy, so that rule must strip client-forged identity headers.
+DIRECT_STRIP=$(kubectl --context "$SPOKE_CONTEXT" -n agentforge get httproute agentforge -o json 2>/dev/null | python3 -c '
+import json,sys
+want={"x-forwarded-user","x-forwarded-preferred-username","x-forwarded-email","x-forwarded-groups",
+      "x-auth-request-user","x-auth-request-email","x-auth-request-groups","x-auth-request-preferred-username",
+      "x-auth-request-access-token"}
+try: rules=json.load(sys.stdin)["spec"]["rules"]
+except Exception: print("route not found"); sys.exit()
+direct=[r for r in rules if any(m.get("path",{}).get("value")=="/health" for m in r.get("matches",[]))]
+if not direct: print("no /health rule"); sys.exit()
+removed={h.lower() for f in direct[0].get("filters",[]) if f.get("type")=="RequestHeaderModifier"
+         for h in f.get("requestHeaderModifier",{}).get("remove",[])}
+missing=sorted(want-removed)
+print("ok" if not missing else "missing: "+",".join(missing))' 2>/dev/null || echo "check failed")
+if [ "$DIRECT_STRIP" = "ok" ]; then
+    ok "HTTPRoute /health,/metrics rule strips the 9 identity headers (X-Forwarded-*, X-Auth-Request-*)"
+else
+    fail "HTTPRoute /health,/metrics rule does not strip identity headers ($DIRECT_STRIP) — forged headers reach the gateway"
+fi
+
+# Gateway ingress: only oauth2-proxy (gateway-infra) and the Envoy proxy pods may reach :8000, each
+# source ONE from-item with BOTH selectors (two separate items would be OR-ed and re-open the hole).
+NP_CHECK=$(kubectl --context "$SPOKE_CONTEXT" -n agentforge get networkpolicy agentforge-allow-ingress -o json 2>/dev/null | python3 -c '
+import json,sys
+try: s=json.load(sys.stdin)["spec"]
+except Exception: print("not found"); sys.exit()
+env={"app.kubernetes.io/name":"envoy","app.kubernetes.io/component":"proxy",
+     "gateway.envoyproxy.io/owning-gateway-name":"helmsman-gateway","gateway.envoyproxy.io/owning-gateway-namespace":"gateway-infra"}
+want={("gateway-infra",json.dumps({"app.kubernetes.io/name":"agentforge-oauth2-proxy"},sort_keys=True)),
+      ("envoy-gateway-system",json.dumps(env,sort_keys=True))}
+ing=s.get("ingress",[])
+fr=ing[0].get("from",[]) if len(ing)==1 else []
+got={(f.get("namespaceSelector",{}).get("matchLabels",{}).get("kubernetes.io/metadata.name"),
+      json.dumps(f.get("podSelector",{}).get("matchLabels",{}),sort_keys=True)) for f in fr}
+bad=[]
+if s.get("podSelector")!={"matchLabels":{"app.kubernetes.io/name":"agentforge-gateway"}}: bad.append("podSelector")
+if s.get("policyTypes")!=["Ingress"]: bad.append("policyTypes")
+if len(ing)!=1 or ing[0].get("ports")!=[{"port":8000,"protocol":"TCP"}]: bad.append("ports")
+if len(fr)!=2 or not all("namespaceSelector" in f and "podSelector" in f for f in fr): bad.append("from-items not AND-ed")
+if got!=want: bad.append("sources")
+if "pod-template-hash" in json.dumps(s): bad.append("hashed label")
+print("ok" if not bad else ",".join(bad))' 2>/dev/null || echo "check failed")
+if [ "$NP_CHECK" = "ok" ]; then
+    ok "NetworkPolicy agentforge/agentforge-allow-ingress matches the contract (oauth2-proxy + Envoy proxy only, TCP 8000)"
+else
+    fail "NetworkPolicy agentforge/agentforge-allow-ingress deviates from the contract ($NP_CHECK) — run tests/component/agentforge-ingress-probe.sh"
+fi
+if kubectl --context "$SPOKE_CONTEXT" -n agentforge get networkpolicy agentforge-allow-prometheus > /dev/null 2>&1; then
+    fail "NetworkPolicy agentforge/agentforge-allow-prometheus still present (removed by PWP-1 item 1.1)"
+else
+    ok "NetworkPolicy agentforge-allow-prometheus absent (as intended)"
+fi
+
 # --- oauth2-proxy -------------------------------------------------------------
 GI_KC_URL=$(kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get secret helmsman-platform-config \
     -o jsonpath='{.data.keycloak-url}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
