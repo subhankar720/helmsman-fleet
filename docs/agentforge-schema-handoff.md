@@ -57,6 +57,20 @@ git push origin main
 Argo CD polls the repo (about every 3 minutes) and syncs automatically (prune + self-heal).
 
 ### 5. Verify — within 10 minutes (the Job is deleted 600 s after it finishes)
+
+**First make sure a sync operation really ran for the new commit.** `Synced` alone is not enough: on
+2026-11-05 Argo CD showed `agentforge` *Synced* at the new commit for 28 minutes while the live ConfigMap
+still had the old `init.sql`, no operation ran and the Job never started (the app uses
+`compare-options: ServerSideDiff=true`; the cached comparison was stale). A hard refresh fixed it at once.
+```bash
+H=--context=kind-helmsman-hub; S=--context=kind-helmsman-onprem
+kubectl $H -n argocd get application agentforge \
+  -o jsonpath='{.status.operationState.syncResult.revision} {.status.operationState.startedAt}{"\n"}'
+# must print the NEW commit. If it still shows the previous commit ~5 min after Argo reports the new
+# revision as Synced, hard-refresh (changes no workload; auto-sync then applies git):
+kubectl $H -n argocd annotate application agentforge argocd.argoproj.io/refresh=hard --overwrite
+```
+Then, as soon as the operation has finished:
 ```bash
 H=--context=kind-helmsman-hub; S=--context=kind-helmsman-onprem
 # a) Argo synced the new commit and the hook succeeded
@@ -108,4 +122,5 @@ pods: all Ready
 
 | Date | AgentForge SHA | Fleet SHA | Change | Result |
 |---|---|---|---|---|
-| 2026-11-05 | `ac01b80` (unchanged) | see WO-P1.B outcome | Dry run: comment-only change to the copy (WO-P1.B) | see WO-P1.B outcome |
+| 2026-11-05 | `ac01b80` (unchanged) | `61e157a` | Dry run: comment-only change to the copy (WO-P1.B) | Synced only after a hard refresh (stale comparison, see step 5); operation 15:24:05–15:24:24Z, PostSync Job Succeeded; Job log not captured (read after the 600 s TTL) |
+| 2026-11-05 | `ac01b80` (unchanged) | revert of `61e157a` | Rollback step: `git revert` of the dry run; copy identical to the source again | see WO-P1.B outcome |
