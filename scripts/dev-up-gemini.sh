@@ -642,7 +642,8 @@ if [ -f "$OPERATOR_DIR/Dockerfile" ] && [ -d "$OPERATOR_DIR/config/default" ]; t
     log_ok "CRDs and RBAC generated" || log_warn "make manifests failed"
 
   if [ -x "$OPERATOR_DIR/bin/kustomize" ]; then
-    # config/overlays/kind sets image helmsman-operator:dev (no sed rewriting)
+    # config/overlays/kind sets image helmsman-operator:dev and imagePullPolicy: Never
+    # (no sed rewriting, no post-apply patch)
     if (cd "$OPERATOR_DIR" && ./bin/kustomize build config/overlays/kind) > "$OPERATOR_MANIFESTS" 2>/dev/null; then
       log_ok "Manifests built via kustomize ($(wc -l < "$OPERATOR_MANIFESTS") lines)"
     else
@@ -659,10 +660,6 @@ if [ -f "$OPERATOR_DIR/Dockerfile" ] && [ -d "$OPERATOR_DIR/config/default" ]; t
   rm -f "$OPERATOR_MANIFESTS"
 
   if kubectl --context "$SPOKE_CTX" get deployment "$OPERATOR_DEPLOY" -n "$OPERATOR_NS" >/dev/null 2>&1; then
-    # helmsman-operator:dev only exists in the kind node's image store
-    kubectl --context "$SPOKE_CTX" patch deployment "$OPERATOR_DEPLOY" -n "$OPERATOR_NS" \
-      --type='json' \
-      -p='[{"op": "add", "path": "/spec/template/spec/containers/0/imagePullPolicy", "value": "Never"}]' > /dev/null 2>&1 || true
     # Pick up a freshly loaded :dev image even if the pod spec didn't change
     kubectl --context "$SPOKE_CTX" rollout restart "deployment/$OPERATOR_DEPLOY" -n "$OPERATOR_NS" > /dev/null 2>&1 || true
     log_info "Waiting for operator deployment to be ready..."
