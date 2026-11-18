@@ -1,10 +1,10 @@
 {{- /*
-  REPLACES the two policies `agentforge-allow-ingress` and `agentforge-allow-prometheus`
-  in templates/networkpolicies.yaml (delete both old blocks, paste this in).
+  agentforge-allow-ingress: who may reach the gateway on TCP 8000 (PWP-1 item 1.1, live since cd616d1).
 
-  Why: the app will trust the X-Forwarded-User / -Groups headers. Today the policy admits EVERY pod in
+  Why: the app trusts the X-Forwarded-User / -Groups headers. The earlier policy admitted every pod in
   gateway-infra, envoy-gateway-system and monitoring, and a pod in gateway-infra that sent a forged
-  X-Forwarded-Groups got 200 (platform test, 2026-10-31). Admit only the two real callers.
+  X-Forwarded-Groups got 200 (platform test, 2026-10-31). Only the two real callers are admitted.
+  Probe: tests/component/agentforge-ingress-probe.sh.
 
   Labels (platform team, 2026-10-31). Never use pod-template-hash or the hashed Envoy Deployment name.
   Both selectors sit in ONE `from` entry, so they are ANDed.
@@ -31,7 +31,7 @@ spec:
           podSelector:
             matchLabels:
               app.kubernetes.io/name: agentforge-oauth2-proxy
-        # Envoy data plane: only the HTTPRoute's exact /health and /metrics rule reaches the gateway directly
+        # Envoy data plane: only the HTTPRoute's exact /health rule reaches the gateway directly
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: envoy-gateway-system

@@ -126,4 +126,15 @@ pods: all Ready
 | Date | AgentForge SHA | Fleet SHA | Change | Result |
 |---|---|---|---|---|
 | 2026-11-05 | `ac01b80` (unchanged) | `61e157a` | Dry run: comment-only change to the copy (WO-P1.B) | Synced only after a hard refresh (stale comparison, see step 5); operation 15:24:05–15:24:24Z, PostSync Job Succeeded; Job log not captured (read after the 600 s TTL) |
-| 2026-11-05 | `ac01b80` (unchanged) | revert of `61e157a` | Rollback step: `git revert` of the dry run; copy identical to the source again | see WO-P1.B outcome |
+| 2026-11-05 | `ac01b80` (unchanged) | `97618b7` (revert of `61e157a`) + `32abd28` | Rollback step: `git revert` of the dry run; copy identical to the source again | Operation Succeeded 16:57:07–16:57:32Z (automated); Job 16:57:26–16:57:31Z succeeded; log 27 lines, 0 ERROR/FATAL |
+| 2026-11-05 | — (platform test, not from AgentForge) | `78c7631` | Sync-wave happy path (WO-P1.B push 6): a nullable test column `team_quotas.wo_p1b_wave_test` added to the copy, plus a temporary pod-template annotation | Operation Succeeded 17:34:49–17:35:09Z; Job 17:35:02–17:35:06Z succeeded, log 28 lines, 0 ERROR/FATAL; the column existed at 17:35:06, before the first new gateway pod was Ready (17:35:23) |
+| 2026-11-06 | `ac01b80` (unchanged) | `57c8c74` (revert of `78c7631`) + `cabfb41` | Clean-up (WO-P1.B push 7): the test column removed from the copy, the annotation removed, the synthetic chart deleted | Operation Succeeded 00:47:03–00:47:21Z; Job 00:47:12–00:47:18Z succeeded, 0 ERROR/FATAL; copy = AgentForge source = live ConfigMap (sha256 `1eaabfbc…`). **The column stays in the live database** (see below) |
+
+### Known schema artefact: `team_quotas.wo_p1b_wave_test`
+
+The live database still has the nullable, empty text column `team_quotas.wo_p1b_wave_test` from the
+`78c7631` test. Reverting the copy removed it from `init.sql`, but the migration is additive only
+(rule 2), so nothing drops it. It is an **orphan**: not in AgentForge's `infra/sql/init.sql`, not in this
+copy. Leave it in place. AgentForge will drop it in a reviewed migration the next time it changes the
+schema (`ALTER TABLE team_quotas DROP COLUMN IF EXISTS wo_p1b_wave_test;`), shipped through this same
+procedure. Until then, a fresh install will not have the column and an existing one will; nothing reads it.
