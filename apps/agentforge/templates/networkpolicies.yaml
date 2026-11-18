@@ -34,7 +34,18 @@ spec:
               kubernetes.io/metadata.name: {{ .Release.Namespace }}
 # agentforge-allow-ingress lives in networkpolicies-narrowed.yaml; agentforge-allow-prometheus was removed.
 ---
-# Allow DNS + outbound to Groq/Confluence/GHCR
+# Egress outside the namespace, per workload class (PWP-1 item 1.5c).
+# In-namespace traffic (gateway/worker/Flower/migration -> Postgres/Redis) is
+# allowed by agentforge-allow-internal above, not by these policies.
+#
+#   gateway, worker, ingest  -> DNS (UDP+TCP 53) and HTTPS (TCP 443) to anywhere
+#                               (Groq, Confluence; NetworkPolicy has no FQDN rules)
+#   Flower, migration Job    -> DNS to kube-dns only: they reach Redis/Postgres by
+#                               Service name, so they must resolve it, nothing else
+#   Postgres, Redis          -> nothing: no policy below selects them
+#
+# Ports 30081/30082 (Keycloak/Vault NodePorts) and 11434 (Ollama) are gone: no
+# AgentForge pod uses them (Vault is read by ESO; the model backend is Groq).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -43,22 +54,48 @@ metadata:
   labels:
     {{- include "agentforge.labels" . | nindent 4 }}
 spec:
-  podSelector: {}
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: [agentforge-gateway, agentforge-worker, agentforge-ingest]
   policyTypes: [Egress]
   egress:
     - ports:                # DNS
         - port: 53
           protocol: UDP
-    - ports:                # HTTPS to Groq, Confluence, GHCR
+        - port: 53
+          protocol: TCP
+    - ports:                # HTTPS to Groq, Confluence
         - port: 443
           protocol: TCP
-    - ports:                # Keycloak NodePort from spoke
-        - port: 30081
-          protocol: TCP
-    - ports:                # Vault NodePort from spoke
-        - port: 30082
-          protocol: TCP
-    - ports:                # Ollama on host.docker.internal
-        - port: 11434
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agentforge-allow-egress-dns
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values: [agentforge-flower, agentforge-db-migrate]
+  policyTypes: [Egress]
+  egress:
+    # ONE `to` item with both selectors, so they are ANDed: kube-dns pods in kube-system only
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
           protocol: TCP
 {{- end }}

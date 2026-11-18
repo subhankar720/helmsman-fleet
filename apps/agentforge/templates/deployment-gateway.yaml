@@ -20,6 +20,9 @@ spec:
       maxSurge: 1
   template:
     metadata:
+      annotations:
+        # PWP-1 item 1.5b: a change to the ConfigMap changes this hash and rolls the pods
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
       labels:
         {{- include "agentforge.labels" . | nindent 8 }}
         app.kubernetes.io/name: agentforge-gateway
