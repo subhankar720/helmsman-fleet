@@ -482,4 +482,4 @@ manual step after a restart
 - `agentforge-cli` is recreated by dev-up and checked by sanity.
 - `oauth2-proxy.yaml` comments explain which identity headers can be trusted.
 - [`cloud-migration-inventory.md`](cloud-migration-inventory.md) and
-  [`25-agentforge-chart.md`](25-agentforge-chart.md) were created with the items you asked for.
+  [`25b-agentforge-chart.md`](25b-agentforge-chart.md) were created with the items you asked for.

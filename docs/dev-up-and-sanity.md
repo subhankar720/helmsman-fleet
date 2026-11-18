@@ -122,7 +122,7 @@ non-root, limits, no privilege escalation), so Kyverno doesn't reject the checks
 
 ## Related references
 
-- [25-agentforge-chart.md](25-agentforge-chart.md): the AgentForge chart as deployed, including the PostSync migrate Job and the ingest CronJob
+- [25b-agentforge-chart.md](25b-agentforge-chart.md): the AgentForge chart as deployed, including the migrate Job (Sync hook) and the ingest CronJob
 - [agentforge-identity-integration.md](agentforge-identity-integration.md): bearer tokens, `agentforge-cli`, issuer, trusted headers, NetworkPolicy test
 - [cloud-migration-inventory.md](cloud-migration-inventory.md): what changes for the Oracle Cloud A1 (arm64) move
 
@@ -140,8 +140,9 @@ non-root, limits, no privilege escalation), so Kyverno doesn't reject the checks
 ## Open items
 
 - **AgentForge application issues** (team-owned): multi-agent pipelines fail on Groq's 8,000
-  tokens-per-minute limit (the router needs to back off on 429), and the chart's `HITL_AUTO_APPROVE`
-  is ignored (the app reads `AGENTFORGE_HITL_AUTO_APPROVE`). The `audit_runs` table is fixed by Phase 7. See
+  tokens-per-minute limit (the router needs to back off on 429). The `audit_runs` table is fixed by Phase 7.
+  (The HITL key is not an open item: the chart sets `AGENTFORGE_HITL_AUTO_APPROVE`, which the app reads,
+  since `6d2ad79`; verified 2026-11-18.) See
   [agentforge-chart-deploy](troubleshooting/agentforge-chart-deploy-2026-10-24.md#open-for-the-agentforge-team).
 - **Hub Kyverno is orphaned.** The controllers and 6 ClusterPolicies still run on the hub with no
   Application managing them.

@@ -1,6 +1,6 @@
-# 25: AgentForge Helm chart (as deployed)
+# 25b: AgentForge Helm chart (as deployed)
 
-Last updated: 2026-10-31
+Last updated: 2026-11-18 (renamed from `25-agentforge-chart.md`; the architect side has its own document 25)
 Chart: `apps/agentforge/` (`Chart.yaml` name `agentforge`, version `0.1.0`, appVersion `0.5.0`)
 Argo CD Application: `agentforge` (`apps/agentforge/argocd-application.yaml`, kubectl-applied), Helm source
 with `values-helmsman-onprem.yaml`, `ServerSideDiff=true`, auto-sync with prune and self-heal
@@ -16,8 +16,8 @@ renders 22 objects:
 
 | Kind | Name | Purpose |
 | --- | --- | --- |
-| Deployment | `agentforge-gateway` | FastAPI gateway, port 8000. Readiness probe `/health` (doesn't trigger LLM calls). |
-| Deployment | `agentforge-worker` | Celery worker, `celery --app=gateway.orchestrator.celery_app worker --queues=sdlc,default --concurrency=2` |
+| Deployment | `agentforge-gateway` | FastAPI gateway, port 8000. Readiness probe `/health` (doesn't trigger LLM calls). Pod template carries `checksum/config`, so a ConfigMap change rolls it. |
+| Deployment | `agentforge-worker` | Celery worker, `celery --app=gateway.orchestrator.celery_app worker --queues=sdlc,default --concurrency=2`. Also carries `checksum/config`. |
 | Deployment | `agentforge-flower` | Celery UI (`mher/flower:2.0`), port 5555 |
 | StatefulSet | `agentforge-postgres` | `pgvector/pgvector:pg16`, 5 Gi PVC, `runAsUser/fsGroup 999` |
 | StatefulSet | `agentforge-redis` | `redis:7-alpine`, 1 Gi PVC; Celery broker (`/0`) and results (`/1`) |
@@ -30,7 +30,7 @@ renders 22 objects:
 | Service | `agentforge-gateway` (8000), `-postgres` (5432), `-redis` (6379), `-flower` (5555) | |
 | ServiceAccount | `agentforge` | |
 | HTTPRoute | `agentforge` | host `agentforge.helmsman.local` on `gateway-infra/helmsman-gateway`; authenticated rule has `timeouts.request: 360s` (`httproute.timeouts`; the Envoy Gateway default is 15 s) |
-| NetworkPolicy ×4 | `agentforge-deny-all`, `-allow-internal`, `-allow-ingress` (in `networkpolicies-narrowed.yaml`), `-allow-egress-external` | see [Network](#network) |
+| NetworkPolicy ×5 | `agentforge-deny-all`, `-allow-internal`, `-allow-ingress` (in `networkpolicies-narrowed.yaml`), `-allow-egress-external`, `-allow-egress-dns` | see [Network](#network) |
 
 `serviceMonitor.enabled: false` on the spoke, because Prometheus runs on the hub.
 
@@ -102,10 +102,13 @@ idempotent: chunk ids are content hashes, so duplicates are skipped.
 | Env | `envFrom` `agentforge-config` (Confluence space key and ancestor id) + `agentforge-secrets` (Confluence URL, email, API token, database URL) |
 | Security | chart pod and container security contexts (non-root, no privilege escalation), Kyverno-compliant |
 | Resources | requests `100m / 128Mi`, limits `500m / 512Mi` |
-| Network | needs egress 443 to Confluence Cloud (allowed by `agentforge-allow-egress-external`) and Postgres in-namespace |
+| Network | needs egress 443 to Confluence Cloud (allowed by `agentforge-allow-egress-external`, which selects `app.kubernetes.io/name=agentforge-ingest`) and Postgres in-namespace |
 
 **Verified 2026-10-31.** Argo CD reports `CronJob is Suspended`. A manual run, `ingest-now`, completed
 earlier (`1/1`, 41 s), and search reports **1,614 chunks** indexed.
+
+**Verified 2026-11-18 (WO-P1.C, after egress was narrowed).** A manual run reached Confluence: 50 pages,
+`Inserted: 1605 | Skipped: 5 | Failed: 0` in 35 s; search then reported 1,638 chunks. The CronJob stayed suspended.
 
 **Operations:**
 
@@ -136,19 +139,27 @@ ESO syncs all-or-nothing, so a missing key blocks Postgres, Flower and every pod
 `dev-up-gemini.sh` Stage 10.5 restores these paths from `~/.helmsman-dev/vault-agentforge.json` and adds any
 missing keys ([identity Q6](agentforge-identity-integration.md#q6-vault-dev-mode-backups-and-re-seeding)).
 
-Known config mismatch: the chart sets `HITL_AUTO_APPROVE`, but the app reads
-`AGENTFORGE_HITL_AUTO_APPROVE`. So the default `false` (approval required) always applies.
+HITL: the ConfigMap key is `AGENTFORGE_HITL_AUTO_APPROVE` (since `6d2ad79`), which is what the app reads
+(`config/settings.py`); `config.hitlAutoApprove: "false"` means approval required. Verified in git, the live
+ConfigMap and the gateway and worker environment on 2026-11-18. (An earlier version of this doc described a
+mismatch with a bare `HITL_AUTO_APPROVE` key; that was wrong, the key has been correct since `6d2ad79`.)
 
 ## Routing
 
 | Path on `agentforge.helmsman.local` | Backend | Auth |
 | --- | --- | --- |
-| `/health`, `/metrics` (exact) | `agentforge-gateway:8000` directly | **none**. `/metrics` is publicly reachable. |
-| `/` (everything else) | `gateway-infra/agentforge-oauth2-proxy:4180` (ReferenceGrant `agentforge-to-oauth2-proxy`) → gateway | Keycloak browser login, or `Authorization: Bearer` (`agentforge-cli`) |
+| `/health` (exact) | `agentforge-gateway:8000` directly | **none** |
+| `/` (everything else, **including `/metrics`** since 2026-11-18) | `gateway-infra/agentforge-oauth2-proxy:4180` (ReferenceGrant `agentforge-to-oauth2-proxy`) → gateway | Keycloak browser login, or `Authorization: Bearer` (`agentforge-cli`). Unauthenticated `/metrics` → 302 to the login; see [metrics plan](agentforge-metrics-plan.md) |
+
+Both rules remove nine client-supplied identity headers by name (`X-Forwarded-User/-Preferred-Username/-Email/-Groups`,
+`X-Auth-Request-User/-Email/-Groups/-Preferred-Username/-Access-Token`): on `/health` since `a406ad6` (2026-11-06), on `/`
+(before oauth2-proxy) since WO-P1.C. `X-Forwarded-For/-Host/-Proto/-Uri` and `Authorization` are kept.
 
 `/health/ready` was removed from the unauthenticated route in `47aeb2c`. oauth2-proxy passes identity
-upstream as `X-Forwarded-User/-Email/-Groups/-Preferred-Username`; **`X-Auth-Request-*` is not set
-upstream and is forgeable**. See [agentforge-identity-integration.md](agentforge-identity-integration.md).
+upstream as `X-Forwarded-User/-Email/-Groups/-Preferred-Username` (it overwrites client copies).
+**`X-Auth-Request-*` is never set upstream**; client copies used to pass through to the gateway and are now
+removed at the edge on every path. The app must still never read them. See
+[agentforge-identity-integration.md](agentforge-identity-integration.md).
 
 ## Network
 
@@ -157,7 +168,12 @@ upstream and is forgeable**. See [agentforge-identity-integration.md](agentforge
 | `agentforge-deny-all` | default deny, ingress and egress, all pods |
 | `agentforge-allow-internal` | all traffic between pods in `agentforge` |
 | `agentforge-allow-ingress` | gateway:8000 **only** from pods labelled `app.kubernetes.io/name=agentforge-oauth2-proxy` in `gateway-infra`, and the `helmsman-gateway` Envoy proxy pods in `envoy-gateway-system` (narrowed 2026-11-01, `cd616d1`) |
-| `agentforge-allow-egress-external` | all pods → **any** destination on 53/UDP, 443, 30081, 30082, 11434 |
+| `agentforge-allow-egress-external` | gateway, worker, ingest → any destination on 53/UDP+TCP and 443/TCP (Groq, Confluence; no FQDN rules exist) |
+| `agentforge-allow-egress-dns` | Flower and the migration Job → kube-dns pods in `kube-system`, 53/UDP+TCP only (they reach Redis/Postgres by Service name) |
+
+Postgres and Redis have no egress outside the namespace (no egress policy selects them). Ports 30081, 30082
+(Keycloak/Vault NodePorts) and 11434 (Ollama) were removed on 2026-11-18 (WO-P1.C, PWP-1 1.5c): no
+AgentForge pod uses them. In-namespace traffic is allowed by `agentforge-allow-internal`, not by the egress policies.
 
 `agentforge-allow-prometheus` was removed on 2026-11-01: the spoke's `monitoring` namespace holds only Promtail,
 which never scrapes :8000.
@@ -177,3 +193,5 @@ After narrowing (2026-11-01), AgentForge's `scripts/test_forged_headers.sh` show
 | 2026-10-26 | Gateway readiness probe → `/health` (`d7df8b1`); `/health/ready` no longer unauthenticated; anchored skip routes (`47aeb2c`); **Phase 7: `init.sql`, PostSync migrate Job, ingest CronJob** (`6d2ad79`) | this doc |
 | 2026-10-31 | Bearer tokens (`--skip-jwt-bearer-tokens`), `--pass-access-token=false`, `agentforge-cli` client | [identity](agentforge-identity-integration.md) |
 | 2026-11-05 | PWP-1 1.2: migration Job PostSync → Sync hook in wave 1; Postgres/Redis wave 0; gateway/worker/Flower/ingest wave 2 (WO-P1.B) | [schema handoff](agentforge-schema-handoff.md) |
+| 2026-11-06 | PWP-1 1.1: nine identity headers stripped on the direct `/health`,`/metrics` rule (`a406ad6`, WO-P1.B) | this doc |
+| 2026-11-18 | PWP-1 1.5: `checksum/config` on gateway and worker; egress per workload class (`76a5a4c`). 1.7: `/metrics` needs a login (`8ee290a`). Header strip on the authenticated `/` rule (`d40944c`). WO-P1.C | [metrics plan](agentforge-metrics-plan.md) |

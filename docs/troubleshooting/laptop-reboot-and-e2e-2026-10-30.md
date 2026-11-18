@@ -121,3 +121,7 @@ This is not a platform or deployment problem. Fixing it needs one of these, all 
 The app reads `AGENTFORGE_HITL_AUTO_APPROVE` (`config/settings.py`), but the chart sets
 `HITL_AUTO_APPROVE`, which has no effect. The default `false` (approval required) is what applies, which
 is the safe setting, but the chart's value is ignored.
+
+> **Correction (2026-11-18, WO-P1.C):** this was already wrong when written. Since `6d2ad79` (2026-10-26) the
+> chart's ConfigMap key is `AGENTFORGE_HITL_AUTO_APPROVE`, the name the app reads; the live ConfigMap and the
+> gateway and worker environment carry `AGENTFORGE_HITL_AUTO_APPROVE=false` (approval required).
