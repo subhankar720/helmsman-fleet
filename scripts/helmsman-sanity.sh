@@ -913,6 +913,24 @@ if [ "$DIRECT_PATHS" = "/health" ]; then
 else
     fail "HTTPRoute direct (no-login) rule covers: ${DIRECT_PATHS} — expected /health only (PWP-1 1.7)"
 fi
+AUTH_STRIP=$(kubectl --context "$SPOKE_CONTEXT" -n agentforge get httproute agentforge -o json 2>/dev/null | python3 -c '
+import json,sys
+want={"x-forwarded-user","x-forwarded-preferred-username","x-forwarded-email","x-forwarded-groups",
+      "x-auth-request-user","x-auth-request-email","x-auth-request-groups","x-auth-request-preferred-username",
+      "x-auth-request-access-token"}
+try: rules=json.load(sys.stdin)["spec"]["rules"]
+except Exception: print("route not found"); sys.exit()
+auth=[r for r in rules if any(m.get("path",{}).get("type")=="PathPrefix" and m.get("path",{}).get("value")=="/" for m in r.get("matches",[]))]
+if not auth: print("no / rule"); sys.exit()
+removed={h.lower() for f in auth[0].get("filters",[]) if f.get("type")=="RequestHeaderModifier"
+         for h in f.get("requestHeaderModifier",{}).get("remove",[])}
+missing=sorted(want-removed)
+print("ok" if not missing else "missing: "+",".join(missing))' 2>/dev/null || echo "check failed")
+if [ "$AUTH_STRIP" = "ok" ]; then
+    ok "HTTPRoute authenticated / rule strips the 9 identity headers before oauth2-proxy (forged X-Auth-Request-* never reach the gateway)"
+else
+    fail "HTTPRoute authenticated / rule does not strip identity headers ($AUTH_STRIP) — forged X-Auth-Request-* reach the gateway"
+fi
 
 # Gateway ingress: only oauth2-proxy (gateway-infra) and the Envoy proxy pods may reach :8000, each
 # source ONE from-item with BOTH selectors (two separate items would be OR-ed and re-open the hole).

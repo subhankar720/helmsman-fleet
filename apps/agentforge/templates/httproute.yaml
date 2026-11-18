@@ -54,6 +54,24 @@ spec:
       timeouts:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      # Remove client-supplied identity headers BEFORE oauth2-proxy. It overwrites
+      # X-Forwarded-User/-Preferred-Username/-Email/-Groups with the real values,
+      # but passes X-Auth-Request-* through unchanged, so a forged copy would
+      # otherwise reach the gateway. Same nine names as the /health rule.
+      # X-Forwarded-For/-Host/-Proto/-Uri and Authorization are kept on purpose.
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            remove:
+              - X-Forwarded-User
+              - X-Forwarded-Preferred-Username
+              - X-Forwarded-Email
+              - X-Forwarded-Groups
+              - X-Auth-Request-User
+              - X-Auth-Request-Email
+              - X-Auth-Request-Groups
+              - X-Auth-Request-Preferred-Username
+              - X-Auth-Request-Access-Token
       backendRefs:
         - name: {{ .Values.httproute.oauth2Proxy.name }}
           namespace: {{ .Values.httproute.oauth2Proxy.namespace }}
