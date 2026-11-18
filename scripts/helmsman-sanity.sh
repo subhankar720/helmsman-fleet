@@ -881,8 +881,9 @@ else
     fail "HTTPRoute agentforge/agentforge not healthy (${ROUTE_STATUS:-not found}) — synced by the agentforge Application"
 fi
 
-# Platform contract (PWP-1 item 1.1, doc 33): /health and /metrics go from Envoy straight to the
-# gateway, bypassing oauth2-proxy, so that rule must strip client-forged identity headers.
+# Platform contract (PWP-1 items 1.1 and 1.7, doc 33): only /health goes from Envoy straight to the
+# gateway, bypassing oauth2-proxy, so that rule must strip client-forged identity headers, and it
+# must not route /metrics (which needs a login since item 1.7).
 DIRECT_STRIP=$(kubectl --context "$SPOKE_CONTEXT" -n agentforge get httproute agentforge -o json 2>/dev/null | python3 -c '
 import json,sys
 want={"x-forwarded-user","x-forwarded-preferred-username","x-forwarded-email","x-forwarded-groups",
@@ -897,9 +898,20 @@ removed={h.lower() for f in direct[0].get("filters",[]) if f.get("type")=="Reque
 missing=sorted(want-removed)
 print("ok" if not missing else "missing: "+",".join(missing))' 2>/dev/null || echo "check failed")
 if [ "$DIRECT_STRIP" = "ok" ]; then
-    ok "HTTPRoute /health,/metrics rule strips the 9 identity headers (X-Forwarded-*, X-Auth-Request-*)"
+    ok "HTTPRoute direct /health rule strips the 9 identity headers (X-Forwarded-*, X-Auth-Request-*)"
 else
-    fail "HTTPRoute /health,/metrics rule does not strip identity headers ($DIRECT_STRIP) — forged headers reach the gateway"
+    fail "HTTPRoute direct /health rule does not strip identity headers ($DIRECT_STRIP) — forged headers reach the gateway"
+fi
+DIRECT_PATHS=$(kubectl --context "$SPOKE_CONTEXT" -n agentforge get httproute agentforge -o json 2>/dev/null | python3 -c '
+import json,sys
+try: rules=json.load(sys.stdin)["spec"]["rules"]
+except Exception: print("route not found"); sys.exit()
+direct=[r for r in rules if any(m.get("path",{}).get("value")=="/health" for m in r.get("matches",[]))]
+print(",".join(sorted(m.get("path",{}).get("value","?") for m in direct[0].get("matches",[]))) if direct else "no /health rule")' 2>/dev/null || echo "check failed")
+if [ "$DIRECT_PATHS" = "/health" ]; then
+    ok "HTTPRoute direct (no-login) rule covers /health only — /metrics needs a login (PWP-1 1.7)"
+else
+    fail "HTTPRoute direct (no-login) rule covers: ${DIRECT_PATHS} — expected /health only (PWP-1 1.7)"
 fi
 
 # Gateway ingress: only oauth2-proxy (gateway-infra) and the Envoy proxy pods may reach :8000, each

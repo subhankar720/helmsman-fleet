@@ -83,7 +83,8 @@ spec:
             # once headers are sent; the route timeout caps their total length.
             - --upstream-timeout=6m
             - --skip-auth-route=^/health$
-            - --skip-auth-route=^/metrics$
+            # No skip-auth for /metrics (PWP-1 item 1.7): it needs a login like
+            # every other path; a scraper reaches the gateway pod in-cluster.
             - --skip-provider-button=true
             - --cookie-secure=false   # HTTP only for local dev — true in prod
             - --cookie-name=_helmsman_auth
