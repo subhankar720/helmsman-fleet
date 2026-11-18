@@ -758,8 +758,13 @@ APP_NAMESPACES=$(kubectl --context "$SPOKE_CTX" get namespaces \
   | grep -v "^kube-\|^default\|^local-path\|^external-secrets\|^kyverno" || echo "sample-app")
 
 for NS in $APP_NAMESPACES; do
-  kubectl --context "$SPOKE_CTX" create namespace "$NS" --dry-run=client -o yaml | \
-    kubectl --context "$SPOKE_CTX" apply -f - > /dev/null 2>&1 || true
+  # Create the namespace only if it is missing (the list above normally comes
+  # from existing namespaces). Never `kubectl apply` a bare Namespace over an
+  # existing one: client-side apply's three-way merge drops every label kept in
+  # its last-applied annotation, which stripped helmsman-operator-system's
+  # labels on every run (WO-1.1b finding; fixed in WO-1.1c).
+  kubectl --context "$SPOKE_CTX" get namespace "$NS" > /dev/null 2>&1 || \
+    kubectl --context "$SPOKE_CTX" create namespace "$NS" > /dev/null 2>&1 || true
 
   kubectl --context "$SPOKE_CTX" create secret generic helmsman-platform-config \
     -n "$NS" \
