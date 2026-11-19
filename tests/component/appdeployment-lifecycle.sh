@@ -155,6 +155,18 @@ wait_for_condition "AppDeployment status Ready=True, phase Ready" \
 echo; echo "▶ 3. while alive"
 assert_eq "Keycloak client and Vault credentials exist for $APP" "kc=yes vault=yes" "$(external_state "$APP")"
 
+# The adc sidecar reaches Keycloak only at start-up for discovery, and kindnet does not filter a new pod's
+# traffic for its first moments, so "pod Ready" alone does not prove the app's NetworkPolicies let it talk to
+# Keycloak later (logins). A probe pod with the app's labels (same policies; never Ready, so never a Service
+# endpoint) waits past that window, then fetches the issuer's discovery document. The URL comes from
+# <app>-oidc via secretKeyRef and is not printed.
+PROBE="$APP-egress-probe"
+k -n "$NS" run "$PROBE" --restart=Never --image=curlimages/curl:latest --override-type=strategic --overrides="$(printf '{"metadata":{"labels":{"app.kubernetes.io/name":"%s","app.kubernetes.io/managed-by":"helmsman"}},"spec":{"securityContext":{"runAsNonRoot":true,"runAsUser":100},"containers":[{"name":"%s","env":[{"name":"ISSUER","valueFrom":{"secretKeyRef":{"name":"%s-oidc","key":"issuer-url"}}}],"readinessProbe":{"exec":{"command":["false"]},"periodSeconds":5},"resources":{"limits":{"cpu":"100m","memory":"64Mi"}},"securityContext":{"allowPrivilegeEscalation":false}}]}}' "$APP" "$PROBE" "$APP")" -- sleep 300 >/dev/null 2>&1
+k -n "$NS" wait --for=jsonpath='{.status.phase}'=Running "pod/$PROBE" --timeout=60s >/dev/null 2>&1; sleep 12
+EGRESS=$(k -n "$NS" exec "$PROBE" -- sh -c 'c=$(curl -s -o /dev/null -w "%{http_code}" --max-time 6 "$ISSUER/.well-known/openid-configuration"); echo "HTTP $c exit $?"' 2>&1 | tail -1)
+k -n "$NS" delete pod "$PROBE" --wait=false >/dev/null 2>&1
+assert_eq "a pod with the app's labels reaches the Keycloak issuer (discovery) after the start-up window" "HTTP 200 exit 0" "$EGRESS"
+
 # ── 4. delete ──────────────────────────────────────────────────────────────────
 echo; echo "▶ 4. delete ($([[ $VARIANT == A ]] && echo "AppDeployment" || echo "NAMESPACE first"))"
 T0=$(date +%s)
