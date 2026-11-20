@@ -1,6 +1,11 @@
 #!/bin/bash
 # =============================================================================
 # helmsman-sanity.sh — v9
+#
+# USAGE:      ./helmsman-sanity.sh [--strict]
+# EXIT CODES: 0  no check failed (warnings, i.e. drift, are allowed)
+#             1  at least one check failed, or --strict and at least one warning
+#             2  unknown option
 # Helmsman Local Dev Environment — Read-Only Sanity / Status Report
 # =============================================================================
 #
@@ -57,6 +62,29 @@ set -uo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 ARGOCD_URL="localhost:9090"
+STRICT=false
+for arg in "$@"; do
+    case "$arg" in
+        --strict) STRICT=true ;;
+        --help|-h)
+            echo "Usage: $(basename "$0") [--strict]"
+            echo "  exit 0: no check failed (warnings allowed); exit 1: a check failed,"
+            echo "  or --strict and any warning; exit 2: unknown option"
+            exit 0 ;;
+        *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
+    esac
+done
+
+# Keycloak admin password and Vault root token: from the environment or from the
+# mode-600 files dev-up-gemini.sh uses (no defaults here; see docs/credentials.md).
+HELMSMAN_STATE_DIR="${HELMSMAN_STATE_DIR:-$HOME/.helmsman-dev}"
+for _cred in KEYCLOAK_ADMIN_PASS:keycloak-admin-password VAULT_TOKEN:vault-root-token; do
+    _var="${_cred%%:*}"; _file="$HELMSMAN_STATE_DIR/${_cred#*:}"
+    if [ -z "${!_var:-}" ] && [ -f "$_file" ]; then printf -v "$_var" '%s' "$(tr -d '\n' < "$_file")"; fi
+done
+KEYCLOAK_ADMIN_PASS="${KEYCLOAK_ADMIN_PASS:-}"; VAULT_TOKEN="${VAULT_TOKEN:-}"
+unset _cred _var _file
+
 ARGOCD_USER="admin"
 
 # Password resolution order: explicit env var > durable password file written
@@ -1057,10 +1085,12 @@ VAULT_POD=$(kubectl --context "$HUB_CONTEXT" -n vault get pods --field-selector=
 AF_VAULT_CS=""
 if [ -z "$VAULT_POD" ]; then
     fail "No running Vault pod on hub"
+elif [ -z "$VAULT_TOKEN" ]; then
+    fail "VAULT_TOKEN not set: export it or write $HELMSMAN_STATE_DIR/vault-root-token (chmod 600); see docs/credentials.md"
 else
     for P in auth llm db cache confluence; do
         DATA=$(kubectl --context "$HUB_CONTEXT" -n vault exec "$VAULT_POD" -- \
-            env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN="${VAULT_TOKEN:-root}" \
+            env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN="$VAULT_TOKEN" \
             vault kv get -format=json "secret/agentforge/$P" 2>/dev/null || echo "")
         if [ -z "$DATA" ]; then
             fail "Vault secret/agentforge/$P missing — $AF_FIX"
@@ -1092,10 +1122,11 @@ else:
 fi
 
 # --- Keycloak: agentforge-gateway client, groups, user -------------------------
+[ -n "$KEYCLOAK_ADMIN_PASS" ] || fail "KEYCLOAK_ADMIN_PASS not set: export it or write $HELMSMAN_STATE_DIR/keycloak-admin-password (chmod 600); see docs/credentials.md"
 KC_REPORT=$(docker exec "$HUB_CONTAINER" sh -c "
     T=\$(curl -s --max-time 10 -X POST http://${HUB_IP}:30081/realms/master/protocol/openid-connect/token \
         -d grant_type=password -d client_id=admin-cli \
-        -d username='${KEYCLOAK_ADMIN_USER:-admin}' -d password='${KEYCLOAK_ADMIN_PASS:-admin}' \
+        -d username='${KEYCLOAK_ADMIN_USER:-admin}' -d password='${KEYCLOAK_ADMIN_PASS}' \
         | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p')
     K=http://${HUB_IP}:30081/admin/realms/helmsman
     echo \"CLIENT \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients?clientId=agentforge-gateway\")\"
@@ -1323,7 +1354,13 @@ else
     [ "$FAIL" -gt 0 ] && echo -e "  ${RED}${BOLD}$FAIL check(s) failed.${NC}"
     echo ""
     echo -e "$RECOVER_HINT"
-    echo -e "  ${YELLOW}(add --reset if that doesn't clear it)${NC}"
+    [ "$FAIL" -gt 0 ] && echo -e "  ${YELLOW}(add --reset if that doesn't clear it)${NC}"
     echo ""
-    exit 1
+    if [ "$FAIL" -gt 0 ]; then
+        exit 1
+    elif $STRICT; then
+        echo -e "  ${YELLOW}--strict: warnings count as failures${NC}"
+        exit 1
+    fi
+    exit 0
 fi

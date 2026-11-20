@@ -11,6 +11,9 @@ across Docker Desktop and laptop restarts:
 Run sanity at the start of a session or after any restart. If it reports failures, run dev-up,
 then sanity again.
 
+sanity exits 0 when no check failed, even with warnings (drift); it exits 1 when a check failed. `--strict` also
+fails on warnings. It suggests `--reset` only when a check failed.
+
 dev-up logs the `argocd` CLI in on its own port-forward (`:9090`), which closes when the script
 exits. To use the CLI afterwards, see
 [Running argocd by hand](troubleshooting/agentforge-chart-deploy-2026-10-24.md#running-argocd-by-hand).
@@ -42,6 +45,9 @@ runtime is lost on restart. dev-up backs it up here on every run and restores it
 | `keycloak-agentforge-user-password` | Password used if Keycloak user `subhankar` has to be recreated. Generated if missing. | you, or Stage 10.5 |
 | `keycloak-af-platform-user-password`, `keycloak-af-readonly-user-password` | Passwords of the AgentForge test users. Generated on first creation. | Stage 10.5 |
 | `last-dev-up` | Time of the last successful run. A node started after it counts as restarted. | Stage 11 |
+| `keycloak-admin-password`, `vault-root-token`, `grafana-admin-password` | Keycloak master admin password, Vault dev root token, Grafana admin password. dev-up stops (exit 2, nothing changed) if one is missing. See [credentials.md](credentials.md) | you |
+| `keycloak-platform-admin-password` | Password of the `helmsman`-realm test user `platform-admin`, which has none in git | you, or a rotation |
+| `dev-up.log` | One line per dev-up run: UTC start and end, flags, mode, exit code. No secrets or command output | every run |
 
 ## dev-up stages
 
