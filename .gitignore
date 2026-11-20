@@ -1,1 +1,13 @@
 platform/keycloak/secret.yaml
+
+# Local credentials and backups (WO-1.5a). They belong in ~/.helmsman-dev/ (mode 600), never in a
+# working tree; see helmsman-fleet docs/credentials.md.
+.env
+.env.*
+*.key
+*.pem
+vault-agentforge.json
+ghcr-pull-secret.json
+*-password
+vault-root-token
+dev-up.log
