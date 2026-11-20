@@ -1,0 +1,8 @@
+# gitleaks configuration for helmsman-fleet (WO-1.5a).
+# CI scans the FULL git history with gitleaks' default rules (useDefault). Reviewed findings are
+# listed one by one, by fingerprint, in .gitleaksignore; nothing is allowlisted by broad pattern.
+# The working tree is scanned separately with .gitleaks-tree.toml (extra shell-default rule).
+title = "helmsman-fleet history scan"
+
+[extend]
+useDefault = true

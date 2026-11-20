@@ -1,0 +1,83 @@
+name: CI
+
+# Push and pull-request checks for the fleet repo (WO-1.5a). Kept small and fast:
+#   gitleaks   full git history (default rules; reviewed findings by fingerprint in .gitleaksignore)
+#              and the working tree (.gitleaks-tree.toml: a credential-named shell variable with a
+#              literal ":-" default, which the default rules miss)
+#   manifests  helm lint on both charts; kubeconform (strict) on the rendered charts and on the plain
+#              manifests that Argo CD applies, against Kubernetes 1.34 (the kind clusters' version)
+#              plus CRD schemas from datreeio/CRDs-catalog pinned to a commit. Resources without any
+#              schema (only our own AppDeployment CRD today) are reported as "skipped" in the summary.
+# No secrets are used. Every tool runs from an image pinned by digest; actions are pinned by SHA.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_IMAGE: zricethezav/gitleaks@sha256:0e99e8821643ea5b235718642b93bb32486af9c8162c8b8731f7cbdc951a7f46 # v8.21.2
+  HELM_IMAGE: alpine/helm@sha256:9b25e60ae264940b276e32866d37e3088e70c4e2d1784b964dc3f90346281a74 # 3.16.4
+  KUBECONFORM_IMAGE: ghcr.io/yannh/kubeconform@sha256:0925177fb05b44ce18574076141b5c3d83235e1904d3f952182ac99ddc45762c # v0.6.7
+  CRD_SCHEMAS: https://raw.githubusercontent.com/datreeio/CRDs-catalog/784ec895547a36e548e6810b41f27baade3a0890/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json
+
+jobs:
+  gitleaks:
+    name: gitleaks (history and tree)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the repo (full history)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan git history
+        run: |
+          docker run --rm --network none -v "$PWD:/repo:ro" "$GITLEAKS_IMAGE" \
+            git /repo --config /repo/.gitleaks.toml --gitleaks-ignore-path /repo/.gitleaksignore \
+            --redact --no-banner --verbose
+
+      - name: Scan working tree
+        run: |
+          docker run --rm --network none -v "$PWD:/repo:ro" "$GITLEAKS_IMAGE" \
+            dir /repo --config /repo/.gitleaks-tree.toml --redact --no-banner --verbose
+
+  manifests:
+    name: helm lint and kubeconform
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the repo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: helm lint
+        run: |
+          helm() { docker run --rm --network none -v "$PWD:/w:ro" -w /w "$HELM_IMAGE" "$@"; }
+          helm lint golden-path-chart -f apps/sample-app/values-helmsman-onprem.yaml
+          helm lint apps/agentforge -f apps/agentforge/values-helmsman-onprem.yaml
+
+      - name: Render the charts as Argo CD does
+        run: |
+          helm() { docker run --rm --network none -v "$PWD:/w:ro" -w /w "$HELM_IMAGE" "$@"; }
+          mkdir -p "$RUNNER_TEMP/rendered"
+          helm template sample-app golden-path-chart -n sample-app \
+            -f apps/sample-app/values-helmsman-onprem.yaml > "$RUNNER_TEMP/rendered/golden-path-sample-app.yaml"
+          helm template agentforge apps/agentforge -n agentforge \
+            -f apps/agentforge/values-helmsman-onprem.yaml > "$RUNNER_TEMP/rendered/agentforge.yaml"
+
+      - name: kubeconform
+        run: |
+          docker run --rm -v "$PWD:/w:ro" -v "$RUNNER_TEMP/rendered:/rendered:ro" -w /w "$KUBECONFORM_IMAGE" \
+            -strict -summary -kubernetes-version 1.34.0 \
+            -schema-location default -schema-location "$CRD_SCHEMAS" \
+            -ignore-missing-schemas \
+            -ignore-filename-pattern '(Chart|values.*)\.yaml$' \
+            -ignore-filename-pattern 'golden-path-chart/templates/' \
+            -ignore-filename-pattern 'apps/agentforge/(templates|files)/' \
+            /rendered platform appdeployments applicationsets apps

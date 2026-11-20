@@ -1,0 +1,18 @@
+# gitleaks configuration for the WORKING-TREE scan of helmsman-fleet (WO-1.5a).
+# gitleaks' default rules do not see a credential written as a shell parameter default,
+# e.g. VAR="${VAULT_TOKEN:-value}". This rule catches that form in the current files, so a
+# default credential cannot come back into scripts/dev-up-gemini.sh, helmsman-sanity.sh or any other script.
+# Not used on history: earlier commits of dev-up-gemini.sh contain such defaults by design of the
+# time, and the history scan (.gitleaks.toml) already covers every other rule.
+title = "helmsman-fleet tree scan"
+
+[[rules]]
+id = "shell-credential-default"
+description = "Shell parameter default on a credential-named variable: ${X_PASSWORD:-value}"
+# value must be literal: not empty, not another $VAR, not a /path
+regex = '''\$\{[A-Z0-9_]*(?:PASS|PASSWORD|PASSWD|TOKEN|SECRET|API_?KEY)[A-Z0-9_]*:-[^}$/\s][^}\s]*\}'''
+keywords = [":-"]
+
+  [rules.allowlist]
+  description = "Test-framework counters, not credentials"
+  regexes = ['''\$\{(?:PASS|FAIL|WARN)_COUNT:-[0-9]+\}''']

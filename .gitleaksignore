@@ -1,0 +1,4 @@
+# gitleaks ignore list for helmsman-fleet (WO-1.5a, reviewed 20 Nov 2026).
+# One fingerprint per finding (commit:file:rule:line), each with a comment saying why it is not a
+# leak. Add an entry only after the same review; never by broad pattern.
+# The full-history scan on 20 Nov found nothing (121 commits), so this list is empty.
