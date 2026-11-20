@@ -58,15 +58,16 @@ fi
 if [ -z "${ARGOCD_PASS:-}" ] && [ -f "$ARGOCD_PASS_FILE" ]; then
   ARGOCD_PASS="$(cat "$ARGOCD_PASS_FILE")"
 fi
-ARGOCD_PASS="${ARGOCD_PASS:-nyKTpDW-m4jQnODE}"  # override via env var after password change
+ARGOCD_PASS="${ARGOCD_PASS:-}"  # env or $ARGOCD_PASS_FILE; checked after argument parsing (docs/credentials.md)
 ARGOCD_USER="admin"
 ARGOCD_NAMESPACE="argocd"
 ARGOCD_PF_PORT="9090"               # port-forward port for argocd CLI
 ARGOCD_PF_PID=""
 
 KEYCLOAK_ADMIN_USER="${KEYCLOAK_ADMIN_USER:-admin}"
-KEYCLOAK_ADMIN_PASS="${KEYCLOAK_ADMIN_PASS:-admin}"   # matches keycloak-admin-credentials Secret
-VAULT_TOKEN="${VAULT_TOKEN:-root}"                    # dev mode root token
+KEYCLOAK_ADMIN_PASS="${KEYCLOAK_ADMIN_PASS:-}"   # env or $HELMSMAN_STATE_DIR/keycloak-admin-password (docs/credentials.md)
+VAULT_TOKEN="${VAULT_TOKEN:-}"                    # env or $HELMSMAN_STATE_DIR/vault-root-token (docs/credentials.md)
+GRAFANA_ADMIN_PASS="${GRAFANA_ADMIN_PASS:-}"      # env or $HELMSMAN_STATE_DIR/grafana-admin-password (docs/credentials.md)
 
 FLEET_REPO="https://github.com/subhankar720/helmsman-fleet.git"
 CLUSTER_SECRET_NAME="cluster-helmsman-onprem"
@@ -104,6 +105,29 @@ AF_KC_PF_PORT="18081"
 
 RESET_MODE=false
 
+# One line per run in $HELMSMAN_STATE_DIR/dev-up.log (mode 600): UTC start and end, the flags
+# given (option names only; anything else is shown as <arg>), the mode banner and the exit code.
+# No secrets and no command output (WO-1.5a).
+DEV_UP_LOG="$HELMSMAN_STATE_DIR/dev-up.log"
+DEV_UP_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+DEV_UP_MODE="not reached"
+DEV_UP_FLAGS=""
+for arg in "$@"; do
+  case "$arg" in
+    -*) DEV_UP_FLAGS="${DEV_UP_FLAGS:+$DEV_UP_FLAGS }${arg%%=*}" ;;
+    *)  DEV_UP_FLAGS="${DEV_UP_FLAGS:+$DEV_UP_FLAGS }<arg>" ;;
+  esac
+done
+record_run() {
+  local rc="$1"
+  mkdir -p "$HELMSMAN_STATE_DIR" 2>/dev/null || return 0
+  ( umask 077
+    printf 'start=%s end=%s flags="%s" mode="%s" exit=%s\n' "$DEV_UP_START" \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${DEV_UP_FLAGS:-none}" "$DEV_UP_MODE" "$rc" >> "$DEV_UP_LOG"
+  ) 2>/dev/null || true
+  chmod 600 "$DEV_UP_LOG" 2>/dev/null || true
+}
+
 # =============================================================================
 # Color helpers
 # =============================================================================
@@ -132,7 +156,7 @@ cleanup() {
     fi
     kill_port_process "${ARGOCD_PF_PORT}"
 }
-trap cleanup EXIT
+trap 'rc=$?; cleanup; record_run "$rc"' EXIT
 
 # =============================================================================
 # Argument parsing
@@ -151,12 +175,56 @@ done
 echo -e "\n${BOLD}${BLUE}========================================${NC}"
 echo -e "${BOLD}${BLUE}  Helmsman Platform Bootstrap           ${NC}"
 if $RESET_MODE; then
+  DEV_UP_MODE="FULL RESET"
   echo -e "${BOLD}${RED}  Mode: FULL RESET                      ${NC}"
 else
+  DEV_UP_MODE="RECOVERY (Docker restart)"
   echo -e "${BOLD}${GREEN}  Mode: RECOVERY (Docker restart)       ${NC}"
 fi
 echo -e "${BOLD}${BLUE}========================================${NC}\n"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Credentials (WO-1.5a). This script holds no credential defaults: each value
+# comes from the environment or from a mode-600 file in $HELMSMAN_STATE_DIR.
+# helmsman-fleet/docs/credentials.md says where each one originates. Checked
+# here, before anything touches a cluster.
+# ─────────────────────────────────────────────────────────────────────────────
+MISSING_CREDENTIALS=()
+load_credential() {  # VAR FILE DESCRIPTION
+  local var="$1" file="$2" what="$3"
+  if [ -z "${!var:-}" ] && [ -f "$file" ]; then
+    if [ -n "$(find "$file" -perm /077 2>/dev/null)" ]; then
+      chmod 600 "$file" && log_warn "$file was readable by group/others; set it to mode 600"
+    fi
+    printf -v "$var" '%s' "$(tr -d '\n' < "$file")"
+  fi
+  if [ -z "${!var:-}" ]; then
+    MISSING_CREDENTIALS+=("$var: $what. Set it with 'export $var=...' or write it to $file (chmod 600)")
+  fi
+}
+# --reset reads a fresh Argo CD password from argocd-initial-admin-secret.
+$RESET_MODE || load_credential ARGOCD_PASS "$ARGOCD_PASS_FILE" "Argo CD admin password (a --reset run writes this file)"
+load_credential KEYCLOAK_ADMIN_PASS "$HELMSMAN_STATE_DIR/keycloak-admin-password" "Keycloak master-realm admin password"
+load_credential VAULT_TOKEN "$HELMSMAN_STATE_DIR/vault-root-token" "Vault dev-mode root token (must equal VAULT_DEV_ROOT_TOKEN_ID in helmsman-fleet platform/vault/deployment.yaml)"
+load_credential GRAFANA_ADMIN_PASS "$HELMSMAN_STATE_DIR/grafana-admin-password" "Grafana admin password (hub Secret monitoring/grafana-admin-credentials)"
+if [ ${#MISSING_CREDENTIALS[@]} -gt 0 ]; then
+  log_error "Missing credentials; nothing has been changed. See helmsman-fleet/docs/credentials.md"
+  for m in "${MISSING_CREDENTIALS[@]}"; do log_error "  $m"; done
+  exit 2
+fi
+log_ok "Credentials loaded (environment or $HELMSMAN_STATE_DIR, values not shown)"
+
+# Grafana admin Secret on the hub (chart: grafana.admin.existingSecret). The value goes in via
+# --from-file on a process substitution so it never appears in a process's arguments.
+ensure_grafana_admin_secret() {
+  kubectl --context "$HUB_CTX" get namespace monitoring > /dev/null 2>&1 || \
+    kubectl --context "$HUB_CTX" create namespace monitoring > /dev/null 2>&1 || true
+  kubectl --context "$HUB_CTX" create secret generic grafana-admin-credentials -n monitoring \
+    --from-literal=admin-user=admin \
+    --from-file=admin-password=<(printf '%s' "$GRAFANA_ADMIN_PASS") \
+    --dry-run=client -o yaml | kubectl --context "$HUB_CTX" apply -f - > /dev/null 2>&1 || true
+}
 # =============================================================================
 # RESET MODE — destroy and recreate clusters
 # =============================================================================
@@ -227,6 +295,8 @@ if $RESET_MODE; then
     -n argocd --timeout=120s
 
   log_step "Stage R3.5: Pre-seeding Hub Platform Bootstrap Secrets"
+  ensure_grafana_admin_secret
+  log_ok "grafana-admin-credentials pre-seeded on Hub"
   # Create Keycloak namespace and secret to prevent CreateContainerConfigError
   kubectl --context "$HUB_CTX" create namespace keycloak --dry-run=client -o yaml | \
     kubectl --context "$HUB_CTX" apply -f -
@@ -752,6 +822,8 @@ kubectl --context "$HUB_CTX" create secret generic keycloak-admin-credentials \
   --dry-run=client -o yaml | \
   kubectl --context "$HUB_CTX" apply -f - > /dev/null 2>&1 || true
 log_ok "keycloak-admin-credentials verified on Hub"
+ensure_grafana_admin_secret
+log_ok "grafana-admin-credentials verified on Hub"
 
 APP_NAMESPACES=$(kubectl --context "$SPOKE_CTX" get namespaces \
   --no-headers -o custom-columns=":metadata.name" 2>/dev/null \

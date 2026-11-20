@@ -5,9 +5,18 @@ HUB_CTX="kind-helmsman-hub"
 SPOKE_CTX="kind-helmsman-onprem"
 TEST_NS="sample-app"
 TEST_APP_NAME="smoke-test-app"
-VAULT_TOKEN="${VAULT_TOKEN:-root}"
 KEYCLOAK_ADMIN_USER="${KEYCLOAK_ADMIN_USER:-admin}"
-KEYCLOAK_ADMIN_PASS="${KEYCLOAK_ADMIN_PASS:-admin}"
+# Credentials: from the environment or the mode-600 files dev-up-gemini.sh uses
+# (no defaults; see docs/credentials.md).
+HELMSMAN_STATE_DIR="${HELMSMAN_STATE_DIR:-$HOME/.helmsman-dev}"
+for _cred in VAULT_TOKEN:vault-root-token KEYCLOAK_ADMIN_PASS:keycloak-admin-password; do
+  _var="${_cred%%:*}"; _file="$HELMSMAN_STATE_DIR/${_cred#*:}"
+  if [ -z "${!_var:-}" ] && [ -f "$_file" ]; then printf -v "$_var" '%s' "$(tr -d '\n' < "$_file")"; fi
+  if [ -z "${!_var:-}" ]; then
+    echo "ERROR: $_var not set: export it or write $_file (chmod 600); see docs/credentials.md" >&2
+    exit 2
+  fi
+done
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

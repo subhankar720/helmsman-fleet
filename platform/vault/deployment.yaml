@@ -21,6 +21,9 @@ spec:
           image: hashicorp/vault:1.18
           args: ["server", "-dev"]
           env:
+            # Known exception (WO-1.5a, human decision 20 Nov): the dev-mode root token is
+            # still a literal. Vault -dev keeps everything in memory, so changing this
+            # restarts Vault and wipes its data; moving it to a Secret is WO-1.5b.
             - name: VAULT_DEV_ROOT_TOKEN_ID
               value: "root"
             - name: VAULT_DEV_LISTEN_ADDRESS
