@@ -1,0 +1,38 @@
+# platform-root: the app-of-apps that owns every Argo CD object which used to be applied by
+# dev-up-gemini.sh --reset (Stage R7) or by hand (WO-1.5b Stage 4). A change to one of the files
+# below now takes effect when it reaches main; no --reset, no kubectl apply.
+#
+# Deliberately NOT owned here:
+#   platform/observability/spoke/promtail-application.yaml  its spec holds the hub and spoke IPs,
+#       which change on every Docker restart; dev-up Stage 7.5 rewrites them, and a git-owned copy
+#       would put the stale IPs from git back.
+#   platform/helmsman-operator/argocd-application.yaml      cloud only; on kind the operator is
+#       deployed by dev-up Stage 4.5 (WO-1.4 moves it under GitOps).
+#   this file                                               the root does not manage itself.
+#
+# Safety: prune is off and the root has no resources-finalizer, so neither a file removed from the
+# list below nor deleting this Application ever deletes a child Application (two children,
+# platform-envoy-gateway and platform-kyverno, carry finalizers that would cascade).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/subhankar720/helmsman-fleet.git
+    targetRevision: main
+    path: .
+    directory:
+      recurse: true
+      include: '{applicationsets/apps-appset.yaml,apps/agentforge/argocd-application.yaml,platform/access-rbac/argocd-application.yaml,platform/envoy-gateway/argocd-application.yaml,platform/envoy-gateway/spoke-application.yaml,platform/eso/argocd-application.yaml,platform/keycloak/argocd-application.yaml,platform/kyverno/argocd-application.yaml,platform/kyverno/policies/argocd-application.yaml,platform/oauth2-proxy-agentforge/argocd-application.yaml,platform/observability/kube-prometheus-stack-application.yaml,platform/observability/loki-application.yaml,platform/observability/loki-nodeport.yaml,platform/vault/argocd-application.yaml}'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: true
+    syncOptions:
+      - ApplyOutOfSyncOnly=true
