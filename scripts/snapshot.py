@@ -14,8 +14,8 @@ Snapshots (each encrypted to the age PUBLIC key from .sops.yaml; files mode 600,
   argo-apps       Applications, ApplicationSets and AppProjects as JSON
 
 Plaintext never reaches the disk: data is piped to `age -r <recipient>` or held in memory. The
-Vault token and the Keycloak admin password are read from the state dir and sent on stdin or in
-an HTTP body, never on a command line. Nothing here prints content.
+Vault token and the Keycloak admin password are read from the state dir and sent over HTTP
+through a port-forward (header or form body), never on a command line. Nothing prints content.
 
 Settings: CLUSTER_PREFIX / HUB_CTX / SPOKE_CTX, HELMSMAN_STATE_DIR, SOPS_AGE_KEY_FILE (check only).
 """
@@ -25,27 +25,18 @@ import hashlib
 import json
 import os
 import re
-import socket
 import subprocess
 import sys
 import time
-import urllib.parse
-import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from helmsman_lib import HUB_CTX, SPOKE_CTX, STATE, PortForward, Vault, die, http  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PREFIX = os.environ.get("CLUSTER_PREFIX", "helmsman-")
-HUB_CTX = os.environ.get("HUB_CTX", "kind-%shub" % PREFIX)
-SPOKE_CTX = os.environ.get("SPOKE_CTX", "kind-%sonprem" % PREFIX)
-STATE = os.path.expanduser(os.environ.get("HELMSMAN_STATE_DIR", "~/.helmsman-dev"))
 SNAPROOT = os.path.join(STATE, "snapshots")
 AGE_KEY = os.path.expanduser(os.environ.get("SOPS_AGE_KEY_FILE", os.path.join(STATE, "age.key")))
 AF_NS, AF_PG_POD = "agentforge", "agentforge-postgres-0"
 REALM = "helmsman"
-
-
-def die(msg, code=2):
-    print("ERROR: " + msg, file=sys.stderr)
-    sys.exit(code)
 
 
 def recipient():
@@ -99,86 +90,48 @@ def snap_db(path):
         die("pg_dump/age failed: %s %s" % (err, enc.stderr.decode().strip()))
 
 
-class PortForward:
-    def __init__(self, ctx, ns, target, remote):
-        s = socket.socket(); s.bind(("127.0.0.1", 0)); self.port = s.getsockname()[1]; s.close()
-        self.p = subprocess.Popen(["kubectl", "--context", ctx, "-n", ns, "port-forward", target,
-                                   "%d:%d" % (self.port, remote)], stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL)
-        for _ in range(50):
-            try:
-                socket.create_connection(("127.0.0.1", self.port), 0.2).close(); return
-            except OSError:
-                time.sleep(0.2)
-        self.close(); die("port-forward to %s/%s did not come up" % (ns, target))
-
-    def close(self):
-        self.p.terminate(); self.p.wait()
-
-
-def http(method, url, token=None, form=None, body=None):
-    data, headers = None, {"Accept": "application/json"}
-    if form is not None:
-        data = urllib.parse.urlencode(form).encode()
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-    elif body is not None:
-        data = json.dumps(body).encode(); headers["Content-Type"] = "application/json"
-    if token:
-        headers["Authorization"] = "Bearer " + token
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read() or b"null")
-
-
 def keycloak_realm():
-    pf = PortForward(HUB_CTX, "keycloak", "svc/keycloak", 80)
-    try:
-        base = "http://127.0.0.1:%d" % pf.port
-        tok = http("POST", base + "/realms/master/protocol/openid-connect/token",
-                   form={"grant_type": "password", "client_id": "admin-cli", "username": "admin",
-                         "password": state_file("keycloak-admin-password")})["access_token"]
-        adm = base + "/admin/realms/" + REALM
-        realm = http("POST", adm + "/partial-export?exportClients=true&exportGroupsAndRoles=true", tok)
+    with PortForward(HUB_CTX, "keycloak", "svc/keycloak", 80) as pf:
+        def get(url, method="GET"):
+            st, j = http(method, url, headers={"Authorization": "Bearer " + tok})
+            if st != 200:
+                die("Keycloak %s %s -> HTTP %d" % (method, url.split("/admin/")[-1], st))
+            return j
+        st, j = http("POST", pf.base + "/realms/master/protocol/openid-connect/token",
+                     form={"grant_type": "password", "client_id": "admin-cli", "username": "admin",
+                           "password": state_file("keycloak-admin-password")})
+        if st != 200:
+            die("Keycloak admin login -> HTTP %d" % st)
+        tok = j["access_token"]
+        adm = pf.base + "/admin/realms/" + REALM
+        realm = get(adm + "/partial-export?exportClients=true&exportGroupsAndRoles=true", "POST")
         restored = 0
         for c in realm.get("clients", []):
             if not c.get("publicClient") and c.get("clientAuthenticatorType") == "client-secret" \
                     and not c.get("bearerOnly"):
-                s = http("GET", adm + "/clients/%s/client-secret" % c["id"], tok)
-                if s and s.get("value"):
-                    c["secret"] = s["value"]; restored += 1
-        users = http("GET", adm + "/users?briefRepresentation=false&max=10000", tok)
+                sec = get(adm + "/clients/%s/client-secret" % c["id"])
+                if sec and sec.get("value"):
+                    c["secret"] = sec["value"]
+                    restored += 1
+        users = get(adm + "/users?briefRepresentation=false&max=10000")
         for u in users:
-            u["groups"] = [g["path"] for g in http("GET", adm + "/users/%s/groups" % u["id"], tok)]
-            u["realmRoles"] = [r["name"] for r in http("GET", adm + "/users/%s/role-mappings/realm" % u["id"], tok)]
+            u["groups"] = [g["path"] for g in get(adm + "/users/%s/groups" % u["id"])]
+            u["realmRoles"] = [r["name"] for r in get(adm + "/users/%s/role-mappings/realm" % u["id"])]
         realm["users"] = users
         realm["_snapshot"] = {"client_secrets_restored": restored, "user_credentials": "not exported (see seed)"}
         return json.dumps(realm, sort_keys=True).encode()
-    finally:
-        pf.close()
 
 
 def vault_kv():
-    pod = run(["kubectl", "--context", HUB_CTX, "-n", "vault", "get", "pods", "-l", "app=vault",
-               "--field-selector=status.phase=Running", "-o", "jsonpath={.items[0].metadata.name}"]).stdout.decode().strip()
-    if not pod:
-        die("no running Vault pod")
-    tok = state_file("vault-root-token")
-    script = 'read -r VAULT_TOKEN; export VAULT_TOKEN VAULT_ADDR=http://127.0.0.1:8200; exec vault "$@" </dev/null'
-    def v(*args):
-        r = run(["kubectl", "--context", HUB_CTX, "-n", "vault", "exec", "-i", pod, "--", "sh", "-c",
-                 script, "sh"] + list(args), stdin=(tok + "\n").encode())
-        return json.loads(r.stdout) if r.returncode == 0 else None
-    out = {}
-    def walk(base):
-        for k in v("kv", "list", "-format=json", "secret/" + base) or []:
-            if k.endswith("/"):
-                walk(base + k)
-            else:
-                d = v("kv", "get", "-format=json", "secret/" + base + k)
-                out[base + k] = {"data": d["data"]["data"], "version": d["data"]["metadata"]["version"]}
-    walk("")
+    with Vault(state_file("vault-root-token")) as v:
+        if not v.token_ok():
+            die("Vault refused the root token from the state dir")
+        out = {}
+        for p in v.list_all():
+            d = v.get_full(p)
+            out[p] = {"data": d["data"], "version": d["metadata"]["version"]}
     if not out:
-        die("Vault returned no paths (token refused?)")
+        die("Vault returned no paths")
     return json.dumps(out, sort_keys=True).encode()
 
 

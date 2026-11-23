@@ -20,8 +20,8 @@ Commands (nothing is ever printed except names, yes/no, lengths and counts):
   verify       every Vault path/property the platform references, every seed-made cluster
                Secret and every state file: present yes/no, equals seed yes/no. Exit 1 on any no.
 
-Credentials never go on a command line: the Vault token is sent on stdin to `kubectl exec -i`
-(read by `read -r` in the container shell), payloads follow on stdin, and Secrets are sent to
+Credentials never go on a command line: Vault is reached over its HTTP API through a
+`kubectl port-forward` (token in the X-Vault-Token header), and Secrets are sent to
 `kubectl apply -f -` as JSON on stdin.
 
 Settings (environment): HUB_CTX, SPOKE_CTX (default kind-<CLUSTER_PREFIX>hub /
@@ -36,11 +36,10 @@ import os
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from helmsman_lib import HUB_CTX, SPOKE_CTX, STATE, Vault, die  # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PREFIX = os.environ.get("CLUSTER_PREFIX", "helmsman-")
-HUB_CTX = os.environ.get("HUB_CTX", "kind-%shub" % PREFIX)
-SPOKE_CTX = os.environ.get("SPOKE_CTX", "kind-%sonprem" % PREFIX)
-STATE = os.path.expanduser(os.environ.get("HELMSMAN_STATE_DIR", "~/.helmsman-dev"))
 SEED = os.environ.get("HELMSMAN_SEED", os.path.join(REPO, "secrets.enc.yaml"))
 AGE_KEY = os.path.expanduser(os.environ.get("SOPS_AGE_KEY_FILE", os.path.join(STATE, "age.key")))
 SOPS = ["sops", "--disable-version-check"]
@@ -83,11 +82,6 @@ def secrets_spec(seed):
 
 
 # ---------------------------------------------------------------- helpers
-def die(msg, code=2):
-    print("ERROR: " + msg, file=sys.stderr)
-    sys.exit(code)
-
-
 def h4(v):
     return hashlib.sha256(v.encode() if isinstance(v, str) else v).hexdigest()[:4]
 
@@ -149,48 +143,6 @@ def write_private(path, content):
 def vault_backup_content(seed):
     af = {k[len(AF_PREFIX):]: v for k, v in seed.get("vault", {}).items() if k.startswith(AF_PREFIX)}
     return json.dumps(af, indent=1, sort_keys=True) if af else None
-
-
-# ---------------------------------------------------------------- vault access
-class Vault:
-    def __init__(self, token):
-        self.token = token
-        r = run(["kubectl", "--context", HUB_CTX, "-n", "vault", "get", "pods", "-l", "app=vault",
-                 "--field-selector=status.phase=Running", "-o", "jsonpath={.items[0].metadata.name}"])
-        self.pod = r.stdout.strip()
-        if r.returncode != 0 or not self.pod:
-            die("no running Vault pod on %s" % HUB_CTX)
-
-    def _exec(self, vault_args, payload=""):
-        # The token is the first stdin line; `read -r` consumes exactly that line. kubectl exec -i
-        # does not pass end-of-input to the container, so the payload is cut with `head -c <bytes>`
-        # (the vault command then sees EOF), and commands without payload get /dev/null.
-        n = len(payload.encode())
-        tail = ('head -c %d | vault "$@"' % n) if n else 'exec vault "$@" </dev/null'
-        script = 'read -r VAULT_TOKEN; export VAULT_TOKEN VAULT_ADDR=http://127.0.0.1:8200; ' + tail
-        return run(["kubectl", "--context", HUB_CTX, "-n", "vault", "exec", "-i", self.pod, "--",
-                    "sh", "-c", script, "sh"] + vault_args, stdin=self.token + "\n" + payload)
-
-    def token_ok(self):
-        return self._exec(["token", "lookup", "-format=json"]).returncode == 0
-
-    def get(self, path):
-        r = self._exec(["kv", "get", "-format=json", "secret/" + path])
-        if r.returncode != 0:
-            return None
-        return json.loads(r.stdout)["data"]["data"]
-
-    def put(self, path, data):
-        return self._exec(["kv", "put", "secret/" + path, "-"], json.dumps(data)).returncode == 0
-
-    def list_all(self, base=""):
-        r = self._exec(["kv", "list", "-format=json", "secret/" + base])
-        if r.returncode != 0:
-            return []
-        out = []
-        for k in json.loads(r.stdout):
-            out += self.list_all(base + k) if k.endswith("/") else [base + k]
-        return out
 
 
 # ---------------------------------------------------------------- k8s access
@@ -304,15 +256,34 @@ def cmd_apply(a):
     tok = seed.get("files", {}).get("vault-root-token")
     if not tok:
         die("seed has no files.vault-root-token")
-    v = Vault(tok)
-    if not v.token_ok():
-        die("Vault refused the seed's root token (is Vault running with it?)", 1)
+    with Vault(tok) as v:
+        if not v.token_ok():
+            die("Vault refused the seed's root token (is Vault running with it?)", 1)
+        failed = apply_vault(v, seed, a.overwrite)
+    for ctx, ns, name, typ, data in secrets_spec(seed):
+        nsr = run(["kubectl", "--context", ctx, "get", "namespace", ns])
+        if nsr.returncode != 0:
+            run(["kubectl", "--context", ctx, "create", "namespace", ns])
+        obj = {"apiVersion": "v1", "kind": "Secret", "type": typ,
+               "metadata": {"name": name, "namespace": ns,
+                            "labels": {"app.kubernetes.io/managed-by": "helmsman-seed"}},
+               "data": {k: base64.b64encode(x.encode()).decode() for k, x in data.items()}}
+        r = run(["kubectl", "--context", ctx, "apply", "--server-side", "--force-conflicts",
+                 "--field-manager=helmsman-seed", "-f", "-"], stdin=json.dumps(obj))
+        failed += r.returncode != 0
+        print("secret   %s %s/%s %s" % (ctx, ns, name, "applied" if r.returncode == 0 else
+                                         "APPLY FAILED: " + r.stderr.strip().splitlines()[-1]))
+    return 1 if failed else 0
+
+
+def apply_vault(v, seed, overwrite):
+    """Fill (default) or overwrite seed paths in Vault; returns the number of failed writes."""
     failed = 0
     for path, want in sorted(seed.get("vault", {}).items()):
         live = v.get(path)
         if live is None:
             data, action = dict(want), "written (was missing)"
-        elif a.overwrite:
+        elif overwrite:
             data = dict(want)
             for p in want:
                 if (path, p) in ENV_DERIVED and p in live:
@@ -330,20 +301,7 @@ def cmd_apply(a):
         ok = v.put(path, data)
         failed += not ok
         print("vault    %-28s %s" % (path, action if ok else "WRITE FAILED"))
-    for ctx, ns, name, typ, data in secrets_spec(seed):
-        nsr =run(["kubectl", "--context", ctx, "get", "namespace", ns])
-        if nsr.returncode != 0:
-            run(["kubectl", "--context", ctx, "create", "namespace", ns])
-        obj = {"apiVersion": "v1", "kind": "Secret", "type": typ,
-               "metadata": {"name": name, "namespace": ns,
-                            "labels": {"app.kubernetes.io/managed-by": "helmsman-seed"}},
-               "data": {k: base64.b64encode(x.encode()).decode() for k, x in data.items()}}
-        r = run(["kubectl", "--context", ctx, "apply", "--server-side", "--force-conflicts",
-                 "--field-manager=helmsman-seed", "-f", "-"], stdin=json.dumps(obj))
-        failed += r.returncode != 0
-        print("secret   %s %s/%s %s" % (ctx, ns, name, "applied" if r.returncode == 0 else
-                                         "APPLY FAILED: " + r.stderr.strip().splitlines()[-1]))
-    return 1 if failed else 0
+    return failed
 
 
 def cmd_verify(a):
@@ -371,32 +329,14 @@ def cmd_verify(a):
     # Vault
     tok = files.get("vault-root-token")
     v = Vault(tok) if tok else None
-    tok_ok = bool(v and v.token_ok())
-    row("vault", "token from seed authenticates", tok_ok, None)
-    if tok_ok:
-        refs = referenced_vault_props()
-        for path, props in svault.items():
-            for p in props:
-                refs.setdefault((path, p), set()).add("seed")
-        cache = {}
-        for (path, prop) in sorted(refs, key=lambda x: (x[0], x[1] or "")):
-            if path not in cache:
-                cache[path] = v.get(path)
-            live = cache[path]
-            want = svault.get(path, {}).get(prop) if prop else None
-            if prop is None:
-                present, equal = live is not None, None
-            else:
-                present = live is not None and prop in live
-                if (path, prop) in ENV_DERIVED or want is None or not present:
-                    equal = None
-                else:
-                    equal = live[prop] == want
-            row("vault", "secret/%s%s" % (path, (" ." + prop) if prop else " (path)"), present,
-                equal, "used by: " + "; ".join(sorted(refs[(path, prop)])))
-        extra = sorted(set(v.list_all()) - {p for p, _ in refs})
-        for p in extra:
-            rows.append("info vault   secret/%s exists in Vault but nothing above references it" % p)
+    try:
+        tok_ok = bool(v and v.token_ok())
+        row("vault", "token from seed authenticates", tok_ok, None)
+        if tok_ok:
+            verify_vault(v, svault, row, rows)
+    finally:
+        if v:
+            v.close()
 
     # cluster Secrets made from the seed
     for ctx, ns, name, typ, data in secrets_spec(seed):
@@ -411,6 +351,33 @@ def cmd_verify(a):
     print("\n".join(rows))
     print("verify: %d checks, %d failed" % (len(rows) - sum(r.startswith("info") for r in rows), bad))
     return 1 if bad else 0
+
+
+def verify_vault(v, svault, row, rows):
+    """Every referenced (path, property): present, and equal to the seed where the seed holds it."""
+    refs = referenced_vault_props()
+    for path, props in svault.items():
+        for p in props:
+            refs.setdefault((path, p), set()).add("seed")
+    cache = {}
+    for (path, prop) in sorted(refs, key=lambda x: (x[0], x[1] or "")):
+        if path not in cache:
+            cache[path] = v.get(path)
+        live = cache[path]
+        want = svault.get(path, {}).get(prop) if prop else None
+        if prop is None:
+            present, equal = live is not None, None
+        else:
+            present = live is not None and prop in live
+            if (path, prop) in ENV_DERIVED or want is None or not present:
+                equal = None
+            else:
+                equal = live[prop] == want
+        row("vault", "secret/%s%s" % (path, (" ." + prop) if prop else " (path)"), present,
+            equal, "used by: " + "; ".join(sorted(refs[(path, prop)])))
+    extra = sorted(set(v.list_all()) - {p for p, _ in refs})
+    for p in extra:
+        rows.append("info vault   secret/%s exists in Vault but nothing above references it" % p)
 
 
 def main():
