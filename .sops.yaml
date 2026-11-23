@@ -1,0 +1,6 @@
+# sops configuration (WO-1.5b). The seed secrets.enc.yaml is encrypted to this age PUBLIC key.
+# The matching private key lives only in ~/.helmsman-dev/age.key (backed up by the human) and is
+# never committed. See docs/bootstrap.md for rotation and loss procedures.
+creation_rules:
+  - path_regex: (^|/)secrets\.enc\.yaml$
+    age: age1teg3e7de2qss2uq7ctnwfceg5t9e9xxtp9g6m9mtzjjdz2pltansqfrcg5

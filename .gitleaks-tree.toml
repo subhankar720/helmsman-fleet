@@ -16,3 +16,9 @@ keywords = [":-"]
   [rules.allowlist]
   description = "Test-framework counters, not credentials"
   regexes = ['''\$\{(?:PASS|FAIL|WARN)_COUNT:-[0-9]+\}''']
+
+[[rules]]
+id = "age-secret-key"
+description = "age private key (WO-1.5b: the seed's key must never enter a working tree)"
+regex = '''AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}'''
+keywords = ["AGE-SECRET-KEY-1"]
