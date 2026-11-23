@@ -14,8 +14,6 @@ spec:
         # Minimal footprint for local dev
         grafana:
           enabled: true
-          annotations:
-            helmsman.dev/values-test: "wo-15b"
           # Admin login from a Secret dev-up-gemini.sh creates on the hub from
           # ~/.helmsman-dev/grafana-admin-password (WO-1.5a; docs/credentials.md).
           admin:
