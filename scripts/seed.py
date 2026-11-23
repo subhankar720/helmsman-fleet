@@ -162,10 +162,12 @@ class Vault:
             die("no running Vault pod on %s" % HUB_CTX)
 
     def _exec(self, vault_args, payload=""):
-        # The token is the first stdin line; `read -r` consumes exactly that line, the rest of
-        # stdin (the JSON payload, if any) stays for the vault command.
-        script = ('read -r VAULT_TOKEN; export VAULT_TOKEN VAULT_ADDR=http://127.0.0.1:8200; '
-                  'exec vault "$@"')
+        # The token is the first stdin line; `read -r` consumes exactly that line. kubectl exec -i
+        # does not pass end-of-input to the container, so the payload is cut with `head -c <bytes>`
+        # (the vault command then sees EOF), and commands without payload get /dev/null.
+        n = len(payload.encode())
+        tail = ('head -c %d | vault "$@"' % n) if n else 'exec vault "$@" </dev/null'
+        script = 'read -r VAULT_TOKEN; export VAULT_TOKEN VAULT_ADDR=http://127.0.0.1:8200; ' + tail
         return run(["kubectl", "--context", HUB_CTX, "-n", "vault", "exec", "-i", self.pod, "--",
                     "sh", "-c", script, "sh"] + vault_args, stdin=self.token + "\n" + payload)
 
