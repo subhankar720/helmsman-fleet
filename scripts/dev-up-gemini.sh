@@ -23,10 +23,21 @@ set -euo pipefail
 #   resolved below so either copy works; override with FLEET_DIR / OPERATOR_DIR.
 
 # =============================================================================
-# Configuration — update if you change cluster names or passwords
+# Configuration — every name, host port and version below is a setting (WO-1.5b):
+# set it in the environment; the defaults are the long-lived local pair.
+#   CLUSTER_PREFIX=rb- gives kind clusters rb-hub / rb-onprem (contexts kind-rb-hub / kind-rb-onprem)
 # =============================================================================
-HUB_CLUSTER_NAME="helmsman-hub"
-SPOKE_CLUSTER_NAME="helmsman-onprem"
+CLUSTER_PREFIX="${CLUSTER_PREFIX:-helmsman-}"
+HUB_CLUSTER_NAME="${HUB_CLUSTER_NAME:-${CLUSTER_PREFIX}hub}"
+SPOKE_CLUSTER_NAME="${SPOKE_CLUSTER_NAME:-${CLUSTER_PREFIX}onprem}"
+# The spoke's name inside Argo CD: destination.name in the fleet repo. It is not
+# the kind cluster name and stays the same for every pair.
+ARGO_SPOKE_NAME="${ARGO_SPOKE_NAME:-helmsman-onprem}"
+# Host ports published by the hub control-plane (clusters/hub-cluster.yaml)
+HUB_HOST_PORT_ARGOCD="${HUB_HOST_PORT_ARGOCD:-8080}"      # -> NodePort 30080 (Argo CD)
+HUB_HOST_PORT_GRAFANA="${HUB_HOST_PORT_GRAFANA:-30030}"   # -> NodePort 30030 (Grafana)
+# Argo CD release installed by --reset/--bootstrap (was the moving "stable" branch)
+ARGOCD_VERSION="${ARGOCD_VERSION:-v3.5.2}"
 HUB_CTX="kind-${HUB_CLUSTER_NAME}"
 SPOKE_CTX="kind-${SPOKE_CLUSTER_NAME}"
 
@@ -49,7 +60,7 @@ CLUSTERS_DIR="$FLEET_DIR/clusters"
 
 # Persisted outside /tmp so it survives reboots. Falls back to the legacy
 # /tmp location written by older versions of this script.
-ARGOCD_PASS_FILE="${ARGOCD_PASS_FILE:-$HOME/.helmsman-dev/argocd-admin-password}"
+ARGOCD_PASS_FILE="${ARGOCD_PASS_FILE:-${HELMSMAN_STATE_DIR:-$HOME/.helmsman-dev}/argocd-admin-password}"
 if [ ! -f "$ARGOCD_PASS_FILE" ] && [ -f /tmp/helmsman-argocd-pass ]; then
   mkdir -p "$(dirname "$ARGOCD_PASS_FILE")"
   tr -d '\n' < /tmp/helmsman-argocd-pass > "$ARGOCD_PASS_FILE"
@@ -70,7 +81,7 @@ VAULT_TOKEN="${VAULT_TOKEN:-}"                    # env or $HELMSMAN_STATE_DIR/v
 GRAFANA_ADMIN_PASS="${GRAFANA_ADMIN_PASS:-}"      # env or $HELMSMAN_STATE_DIR/grafana-admin-password (docs/credentials.md)
 
 FLEET_REPO="https://github.com/subhankar720/helmsman-fleet.git"
-CLUSTER_SECRET_NAME="cluster-helmsman-onprem"
+CLUSTER_SECRET_NAME="cluster-${ARGO_SPOKE_NAME}"
 ARGOCD_MANAGER_SA="argocd-manager"
 
 OPERATOR_DEPLOY="helmsman-operator-controller-manager"
@@ -104,6 +115,8 @@ AF_KC_USERS="subhankar:/teams/dev-team af-platform-user:/teams/platform-team af-
 AF_KC_PF_PORT="18081"
 
 RESET_MODE=false
+BOOTSTRAP_MODE=false     # --bootstrap: create missing clusters and install everything; never deletes
+PRINT_CONFIG=false
 
 # One line per run in $HELMSMAN_STATE_DIR/dev-up.log (mode 600): UTC start and end, the flags
 # given (option names only; anything else is shown as <arg>), the mode banner and the exit code.
@@ -164,19 +177,38 @@ trap 'rc=$?; cleanup; record_run "$rc"' EXIT
 for arg in "$@"; do
   case $arg in
     --reset|--clean|-c) RESET_MODE=true ;;
+    --bootstrap) BOOTSTRAP_MODE=true ;;
+    --print-config) PRINT_CONFIG=true ;;
     --help|-h)
-      echo "Usage: ./scripts/dev-up.sh [OPTIONS]"
-      echo "  --reset, --clean, -c    Full rebuild from scratch"
+      echo "Usage: ./scripts/dev-up-gemini.sh [OPTIONS]"
+      echo "  --reset, --clean, -c    Full rebuild from scratch (DELETES the named clusters first)"
+      echo "  --bootstrap             Create the named clusters if missing, then install everything;"
+      echo "                          never deletes. Used by scripts/bootstrap.sh"
+      echo "  --print-config          Print the resolved settings and exit (touches nothing)"
       echo "  --help, -h              Show this help"
       exit 0 ;;
   esac
 done
+if $RESET_MODE && $BOOTSTRAP_MODE; then
+  echo "--reset and --bootstrap are mutually exclusive" >&2; exit 2
+fi
+if $PRINT_CONFIG; then
+  for v in CLUSTER_PREFIX HUB_CLUSTER_NAME SPOKE_CLUSTER_NAME HUB_CTX SPOKE_CTX ARGO_SPOKE_NAME \
+           CLUSTER_SECRET_NAME HUB_HOST_PORT_ARGOCD HUB_HOST_PORT_GRAFANA ARGOCD_VERSION ARGOCD_PF_PORT \
+           AF_KC_PF_PORT FLEET_REPO FLEET_DIR OPERATOR_DIR CLUSTERS_DIR HELMSMAN_STATE_DIR; do
+    printf '%s=%s\n' "$v" "${!v}"
+  done
+  trap - EXIT; exit 0
+fi
 
 echo -e "\n${BOLD}${BLUE}========================================${NC}"
 echo -e "${BOLD}${BLUE}  Helmsman Platform Bootstrap           ${NC}"
 if $RESET_MODE; then
   DEV_UP_MODE="FULL RESET"
   echo -e "${BOLD}${RED}  Mode: FULL RESET                      ${NC}"
+elif $BOOTSTRAP_MODE; then
+  DEV_UP_MODE="BOOTSTRAP"
+  echo -e "${BOLD}${GREEN}  Mode: BOOTSTRAP (create if missing)   ${NC}"
 else
   DEV_UP_MODE="RECOVERY (Docker restart)"
   echo -e "${BOLD}${GREEN}  Mode: RECOVERY (Docker restart)       ${NC}"
@@ -204,7 +236,12 @@ load_credential() {  # VAR FILE DESCRIPTION
   fi
 }
 # --reset reads a fresh Argo CD password from argocd-initial-admin-secret.
-$RESET_MODE || load_credential ARGOCD_PASS "$ARGOCD_PASS_FILE" "Argo CD admin password (a --reset run writes this file)"
+# --bootstrap sets the Argo CD password to $ARGOCD_PASS_FILE (from the seed) when that file exists.
+if $BOOTSTRAP_MODE; then
+  [ -z "${ARGOCD_PASS:-}" ] && [ -f "$ARGOCD_PASS_FILE" ] && ARGOCD_PASS="$(tr -d '\n' < "$ARGOCD_PASS_FILE")"
+elif ! $RESET_MODE; then
+  load_credential ARGOCD_PASS "$ARGOCD_PASS_FILE" "Argo CD admin password (a --reset run writes this file)"
+fi
 load_credential KEYCLOAK_ADMIN_PASS "$HELMSMAN_STATE_DIR/keycloak-admin-password" "Keycloak master-realm admin password"
 load_credential VAULT_TOKEN "$HELMSMAN_STATE_DIR/vault-root-token" "Vault dev-mode root token (must equal VAULT_DEV_ROOT_TOKEN_ID in helmsman-fleet platform/vault/deployment.yaml)"
 load_credential GRAFANA_ADMIN_PASS "$HELMSMAN_STATE_DIR/grafana-admin-password" "Grafana admin password (hub Secret monitoring/grafana-admin-credentials)"
@@ -214,6 +251,75 @@ if [ ${#MISSING_CREDENTIALS[@]} -gt 0 ]; then
   exit 2
 fi
 log_ok "Credentials loaded (environment or $HELMSMAN_STATE_DIR, values not shown)"
+
+# Argo CD session token from the API (POST /api/v1/session). The password is passed to
+# python in its environment and sent in the request body; the token is exported as
+# ARGOCD_AUTH_TOKEN, which the argocd CLI reads, so no password is on any command line.
+argocd_token() {  # PASSWORD -> prints a session token; non-zero on failure
+  ARGOCD_LOGIN_PASS="$1" ARGOCD_LOGIN_USER="$ARGOCD_USER" python3 - "localhost:${ARGOCD_PF_PORT}" <<'PY'
+import json, os, ssl, sys, urllib.error, urllib.request
+body = json.dumps({"username": os.environ["ARGOCD_LOGIN_USER"],
+                   "password": os.environ["ARGOCD_LOGIN_PASS"]}).encode()
+for url, ctx in (("https://%s/api/v1/session" % sys.argv[1], ssl._create_unverified_context()),
+                 ("http://%s/api/v1/session" % sys.argv[1], None)):
+    try:
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15, context=ctx) as r:
+            print(json.load(r)["token"]); sys.exit(0)
+    except urllib.error.HTTPError as e:
+        print("HTTP %d" % e.code, file=sys.stderr); sys.exit(1)
+    except Exception as e:
+        err = str(e)
+print(err, file=sys.stderr); sys.exit(1)
+PY
+}
+argocd_set_password() {  # CURRENT NEW: change the admin password through the API
+  local tok
+  tok=$(argocd_token "$1") || return 1
+  ARGOCD_TOK="$tok" ARGOCD_CUR="$1" ARGOCD_NEW="$2" python3 - "localhost:${ARGOCD_PF_PORT}" <<'PY'
+import json, os, ssl, sys, urllib.request
+body = json.dumps({"name": "admin", "currentPassword": os.environ["ARGOCD_CUR"],
+                   "newPassword": os.environ["ARGOCD_NEW"]}).encode()
+req = urllib.request.Request("https://%s/api/v1/account/password" % sys.argv[1], data=body, method="PUT",
+                             headers={"Content-Type": "application/json",
+                                      "Authorization": "Bearer " + os.environ["ARGOCD_TOK"]})
+urllib.request.urlopen(req, timeout=15, context=ssl._create_unverified_context())
+PY
+}
+argocd_cli_login() {  # tries N times; exports ARGOCD_AUTH_TOKEN for the argocd CLI
+  local n="$1" pause="$2" i tok
+  LOGIN_ERR=""
+  for i in $(seq 1 "$n"); do
+    if tok=$(argocd_token "$ARGOCD_PASS" 2>/tmp/argocd-login.err); then
+      export ARGOCD_AUTH_TOKEN="$tok"
+      return 0
+    fi
+    LOGIN_ERR=$(tail -1 /tmp/argocd-login.err 2>/dev/null)
+    log_warn "Login attempt $i/$n failed: ${LOGIN_ERR} — waiting ${pause}s..."
+    sleep "$pause"
+  done
+  return 1
+}
+render_kind_config() {  # FILE NAME -> path of a temp copy with the configured name and host ports
+  local out
+  out=$(mktemp "/tmp/kind-${2}.XXXXXX.yaml")
+  sed -e "s/^name: .*/name: ${2}/" \
+      -e "s/hostPort: 8080\$/hostPort: ${HUB_HOST_PORT_ARGOCD}/" \
+      -e "s/hostPort: 30030\$/hostPort: ${HUB_HOST_PORT_GRAFANA}/" "$1" > "$out"
+  echo "$out"
+}
+create_kind_cluster() {  # NAME CONFIG-FILE: creates it; with --bootstrap an existing cluster is kept
+  local name="$1" file="$CLUSTERS_DIR/$2" cfg
+  if $BOOTSTRAP_MODE && kind get clusters 2>/dev/null | grep -qx "$name"; then
+    log_ok "Kind cluster $name already exists (kept)"
+    return 0
+  fi
+  [ -f "$file" ] || { log_error "$2 not found in $CLUSTERS_DIR"; exit 1; }
+  cfg=$(render_kind_config "$file" "$name")
+  kind create cluster --name "$name" --config "$cfg" || { rm -f "$cfg"; log_error "kind create cluster $name failed"; exit 1; }
+  rm -f "$cfg"
+  log_ok "Kind cluster $name created"
+}
 
 # Grafana admin Secret on the hub (chart: grafana.admin.existingSecret). The value goes in via
 # --from-file on a process substitution so it never appears in a process's arguments.
@@ -228,27 +334,16 @@ ensure_grafana_admin_secret() {
 # =============================================================================
 # RESET MODE — destroy and recreate clusters
 # =============================================================================
+if $RESET_MODE || $BOOTSTRAP_MODE; then
 if $RESET_MODE; then
   log_step "Stage R1: Destroying existing Kind clusters"
   kind delete cluster --name "$HUB_CLUSTER_NAME" 2>/dev/null && log_ok "Hub cluster deleted" || log_warn "Hub cluster not found"
   kind delete cluster --name "$SPOKE_CLUSTER_NAME" 2>/dev/null && log_ok "Spoke cluster deleted" || log_warn "Spoke cluster not found"
 
-  log_step "Stage R2: Creating fresh Kind clusters"
-  if [ -f "$CLUSTERS_DIR/hub-cluster.yaml" ]; then
-    kind create cluster --config "$CLUSTERS_DIR/hub-cluster.yaml"
-  else
-    log_error "hub-cluster.yaml not found in $CLUSTERS_DIR"
-    exit 1
-  fi
-  log_ok "Hub cluster created"
-
-  if [ -f "$CLUSTERS_DIR/onprem-spoke-cluster.yaml" ]; then
-    kind create cluster --config "$CLUSTERS_DIR/onprem-spoke-cluster.yaml"
-  else
-    log_error "onprem-spoke-cluster.yaml not found in $CLUSTERS_DIR"
-    exit 1
-  fi
-  log_ok "Spoke cluster created"
+fi
+  log_step "Stage R2: Creating Kind clusters"
+  create_kind_cluster "$HUB_CLUSTER_NAME" hub-cluster.yaml
+  create_kind_cluster "$SPOKE_CLUSTER_NAME" onprem-spoke-cluster.yaml
 
   log_step "Stage R3: Installing Argo CD on Hub"
   kubectl --context "$HUB_CTX" create namespace argocd --dry-run=client -o yaml | \
@@ -256,7 +351,7 @@ if $RESET_MODE; then
 
   # Fix: Use --server-side --force-conflicts to prevent "annotation too long (>256KB)" on CRDs
   kubectl --context "$HUB_CTX" apply --server-side --force-conflicts -n argocd \
-    -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+    -f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/install.yaml"
 
   # Fix: Increase git clone timeout for initial large repository fetches
   kubectl --context "$HUB_CTX" patch configmap argocd-cmd-params-cm \
@@ -279,15 +374,21 @@ if $RESET_MODE; then
   kubectl --context "$HUB_CTX" patch svc argocd-server -n argocd \
     -p '{"spec":{"type":"NodePort","ports":[{"port":443,"targetPort":8080,"nodePort":30080}]}}'
 
-  # Get and save admin password
-  ARGOCD_PASS=$(kubectl --context "$HUB_CTX" \
+  # Admin password. --reset keeps Argo CD's random initial password and saves it;
+  # --bootstrap with a password file (from the seed) changes it to that value in Stage R4.
+  ARGOCD_INITIAL_PASS=$(kubectl --context "$HUB_CTX" \
     get secret argocd-initial-admin-secret -n argocd \
-    -o jsonpath="{.data.password}" | base64 -d)
-  mkdir -p "$(dirname "$ARGOCD_PASS_FILE")"
-  echo -n "$ARGOCD_PASS" > "$ARGOCD_PASS_FILE"
-  chmod 600 "$ARGOCD_PASS_FILE"
-  log_ok "Argo CD installed. Admin password saved to $ARGOCD_PASS_FILE"
-  kubectl --context "$HUB_CTX" delete secret argocd-initial-admin-secret -n argocd
+    -o jsonpath="{.data.password}" 2>/dev/null | base64 -d)
+  if $BOOTSTRAP_MODE && [ -n "${ARGOCD_PASS:-}" ]; then
+    log_ok "Argo CD installed. The admin password will be set from $ARGOCD_PASS_FILE"
+  else
+    ARGOCD_PASS="$ARGOCD_INITIAL_PASS"
+    mkdir -p "$(dirname "$ARGOCD_PASS_FILE")"
+    ( umask 077; printf '%s' "$ARGOCD_PASS" > "$ARGOCD_PASS_FILE" )
+    chmod 600 "$ARGOCD_PASS_FILE"
+    log_ok "Argo CD installed. Admin password saved to $ARGOCD_PASS_FILE"
+    kubectl --context "$HUB_CTX" delete secret argocd-initial-admin-secret -n argocd --ignore-not-found
+  fi
 
   # Restart repo-server to pick up timeout config
   kubectl --context "$HUB_CTX" rollout restart deployment/argocd-repo-server -n argocd
@@ -304,9 +405,9 @@ if $RESET_MODE; then
   kubectl --context "$HUB_CTX" create secret generic keycloak-admin-credentials \
     -n keycloak \
     --from-literal=admin-user="$KEYCLOAK_ADMIN_USER" \
-    --from-literal=admin-password="$KEYCLOAK_ADMIN_PASS" \
+    --from-file=admin-password=<(printf '%s' "$KEYCLOAK_ADMIN_PASS") \
     --from-literal=username="$KEYCLOAK_ADMIN_USER" \
-    --from-literal=password="$KEYCLOAK_ADMIN_PASS" \
+    --from-file=password=<(printf '%s' "$KEYCLOAK_ADMIN_PASS") \
     --dry-run=client -o yaml | kubectl --context "$HUB_CTX" apply -f -
   log_ok "Keycloak admin credentials pre-seeded on Hub"
 
@@ -319,20 +420,25 @@ if $RESET_MODE; then
   sleep 8
 
   if [ -f "$ARGOCD_PASS_FILE" ]; then
-    ARGOCD_PASS=$(cat "$ARGOCD_PASS_FILE")
+    ARGOCD_PASS=$(tr -d '\n' < "$ARGOCD_PASS_FILE")
   fi
-  
-  for attempt in 1 2 3; do
-    if argocd login "localhost:${ARGOCD_PF_PORT}" \
-        --username "$ARGOCD_USER" \
-        --password "$ARGOCD_PASS" \
-        --insecure > /dev/null 2>&1; then
-      log_ok "Argo CD CLI logged in"
-      break
-    fi
-    log_warn "Login attempt $attempt failed, retrying..."
-    sleep 10
-  done
+
+  # --bootstrap: move the admin password from Argo CD's initial one to the seed's value
+  if $BOOTSTRAP_MODE && [ -n "${ARGOCD_INITIAL_PASS:-}" ] && [ "$ARGOCD_INITIAL_PASS" != "$ARGOCD_PASS" ]; then
+    for attempt in 1 2 3 4 5; do
+      if argocd_set_password "$ARGOCD_INITIAL_PASS" "$ARGOCD_PASS" 2>/dev/null; then
+        log_ok "Argo CD admin password set from $ARGOCD_PASS_FILE"
+        kubectl --context "$HUB_CTX" delete secret argocd-initial-admin-secret -n argocd --ignore-not-found
+        break
+      fi
+      log_warn "Setting the Argo CD admin password: attempt $attempt failed, retrying..."
+      sleep 10
+    done
+  fi
+
+  if argocd_cli_login 3 10; then
+    log_ok "Argo CD CLI logged in"
+  fi
 
   log_step "Stage R5: Registering fleet repository"
   argocd repo add "$FLEET_REPO" --server "localhost:${ARGOCD_PF_PORT}" --insecure 2>/dev/null || true
@@ -399,7 +505,7 @@ metadata:
     platform-enabled: "true"
 type: Opaque
 stringData:
-  name: helmsman-onprem
+  name: ${ARGO_SPOKE_NAME}
   server: https://${SPOKE_IP}:6443
   config: |
     {"bearerToken":"${SPOKE_TOKEN}","tlsClientConfig":{"insecure":true}}
@@ -412,7 +518,7 @@ EOF
   
   kubectl --context "$SPOKE_CTX" create secret generic vault-token \
     -n external-secrets \
-    --from-literal=token="$VAULT_TOKEN" \
+    --from-file=token=<(printf '%s' "$VAULT_TOKEN") \
     --dry-run=client -o yaml | kubectl --context "$SPOKE_CTX" apply -f -
   log_ok "Vault token secret pre-seeded on Spoke for ESO"
 
@@ -774,7 +880,7 @@ metadata:
     platform-enabled: "true"
 type: Opaque
 stringData:
-  name: helmsman-onprem
+  name: ${ARGO_SPOKE_NAME}
   server: https://${SPOKE_IP}:6443
   config: |
     {"bearerToken":"${SPOKE_TOKEN}","tlsClientConfig":{"insecure":true}}
@@ -816,9 +922,9 @@ kubectl --context "$HUB_CTX" create namespace keycloak --dry-run=client -o yaml 
 kubectl --context "$HUB_CTX" create secret generic keycloak-admin-credentials \
   -n keycloak \
   --from-literal=admin-user="$KEYCLOAK_ADMIN_USER" \
-  --from-literal=admin-password="$KEYCLOAK_ADMIN_PASS" \
+  --from-file=admin-password=<(printf '%s' "$KEYCLOAK_ADMIN_PASS") \
   --from-literal=username="$KEYCLOAK_ADMIN_USER" \
-  --from-literal=password="$KEYCLOAK_ADMIN_PASS" \
+  --from-file=password=<(printf '%s' "$KEYCLOAK_ADMIN_PASS") \
   --dry-run=client -o yaml | \
   kubectl --context "$HUB_CTX" apply -f - > /dev/null 2>&1 || true
 log_ok "keycloak-admin-credentials verified on Hub"
@@ -843,10 +949,10 @@ for NS in $APP_NAMESPACES; do
     --from-literal=keycloak-url="http://${HUB_IP}:30081" \
     --from-literal=keycloak-oidc-url="http://host.docker.internal:8081" \
     --from-literal=keycloak-admin-user="$KEYCLOAK_ADMIN_USER" \
-    --from-literal=keycloak-admin-password="$KEYCLOAK_ADMIN_PASS" \
+    --from-file=keycloak-admin-password=<(printf '%s' "$KEYCLOAK_ADMIN_PASS") \
     --from-literal=keycloak-realm="helmsman" \
     --from-literal=vault-url="http://${HUB_IP}:30082" \
-    --from-literal=vault-token="$VAULT_TOKEN" \
+    --from-file=vault-token=<(printf '%s' "$VAULT_TOKEN") \
     --from-literal=cluster-name="$SPOKE_CLUSTER_NAME" \
     --dry-run=client -o yaml | \
     kubectl --context "$SPOKE_CTX" apply -f - > /dev/null 2>&1 || true
@@ -858,7 +964,7 @@ kubectl --context "$SPOKE_CTX" create namespace external-secrets --dry-run=clien
 
 kubectl --context "$SPOKE_CTX" create secret generic vault-token \
   -n external-secrets \
-  --from-literal=token="$VAULT_TOKEN" \
+  --from-file=token=<(printf '%s' "$VAULT_TOKEN") \
   --dry-run=client -o yaml | \
   kubectl --context "$SPOKE_CTX" apply -f - > /dev/null 2>&1 || true
 log_ok "vault-token Secret ensured in external-secrets namespace"
@@ -1000,7 +1106,7 @@ done
 log_step "Stage 9: Argo CD CLI Login"
 
 if [ -f "$ARGOCD_PASS_FILE" ]; then
-  ARGOCD_PASS=$(cat "$ARGOCD_PASS_FILE")
+  ARGOCD_PASS=$(tr -d '\n' < "$ARGOCD_PASS_FILE")
 fi
 
 kill_port_process "${ARGOCD_PF_PORT}"
@@ -1017,18 +1123,10 @@ done
 
 LOGIN_OK=false
 LOGIN_ERR=""
-for attempt in 1 2 3 4 5; do
-  if LOGIN_ERR=$(argocd login "localhost:${ARGOCD_PF_PORT}" \
-      --username "$ARGOCD_USER" \
-      --password "$ARGOCD_PASS" \
-      --insecure 2>&1 > /dev/null); then
-    log_ok "Argo CD CLI logged in via port-forward :${ARGOCD_PF_PORT}"
-    LOGIN_OK=true
-    break
-  fi
-  log_warn "Login attempt $attempt/5 failed: ${LOGIN_ERR} — waiting 3s..."
-  sleep 3
-done
+if argocd_cli_login 5 3; then
+  log_ok "Argo CD CLI logged in via port-forward :${ARGOCD_PF_PORT}"
+  LOGIN_OK=true
+fi
 
 if ! $LOGIN_OK; then
   log_error "Argo CD CLI login failed after 5 attempts. If the password file is stale, reset it:"
@@ -1257,10 +1355,16 @@ REQUIRED = {
 }
 
 def vault(*args, stdin=None):
+    # Token on stdin (first line, read by `read -r`), never in the exec arguments. kubectl exec -i
+    # does not pass end-of-input on, so a payload is cut with `head -c <bytes>`.
+    payload = stdin or ""
+    n = len(payload.encode())
+    tail = ('head -c %d | vault "$@"' % n) if n else 'exec vault "$@" </dev/null'
     return subprocess.run(
-        ["kubectl", "--context", ctx, "exec", "-i", "-n", "vault", pod, "--",
-         "env", "VAULT_ADDR=http://127.0.0.1:8200", "VAULT_TOKEN=" + tok, "vault", *args],
-        input=stdin, capture_output=True, text=True)
+        ["kubectl", "--context", ctx, "exec", "-i", "-n", "vault", pod, "--", "sh", "-c",
+         "read -r VAULT_TOKEN; export VAULT_TOKEN VAULT_ADDR=http://127.0.0.1:8200; " + tail,
+         "sh", *args],
+        input=tok + "\n" + payload, capture_output=True, text=True)
 
 def get(p):
     r = vault("kv", "get", "-format=json", "secret/agentforge/" + p)

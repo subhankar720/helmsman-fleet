@@ -4,10 +4,8 @@ metadata:
   name: helmsman-realm
   namespace: keycloak
   annotations:
-    # platform-admin is a synthetic test identity. It has no password in git
-    # (WO-1.5a): set one from ~/.helmsman-dev/keycloak-platform-admin-password
-    # with the Keycloak admin API when needed (docs/credentials.md). Keycloak
-    # has no PVC, so after a restart the re-imported user has no password.
+    # The realm import holds no users (WO-1.5b: the test identity platform-admin was
+    # removed; nothing referenced it). dev-up Stage 10.5 creates the AgentForge users.
     helmsman.dev/secret-classification: dev-only
 data:
   helmsman-realm.json: |
@@ -18,13 +16,5 @@ data:
       "sslRequired": "external",
       "registrationAllowed": false,
       "loginWithEmailAllowed": true,
-      "bruteForceProtected": true,
-      "users": [
-        {
-          "username": "platform-admin",
-          "enabled": true,
-          "email": "platform-admin@helmsman.dev",
-          "realmRoles": ["default-roles-helmsman"]
-        }
-      ]
+      "bruteForceProtected": true
     }

@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -eo pipefail
 
-HUB_CTX="kind-helmsman-hub"
-SPOKE_CTX="kind-helmsman-onprem"
+# Cluster names are settings (WO-1.5b), same defaults as dev-up-gemini.sh.
+CLUSTER_PREFIX="${CLUSTER_PREFIX:-helmsman-}"
+HUB_CLUSTER_NAME="${HUB_CLUSTER_NAME:-${CLUSTER_PREFIX}hub}"
+SPOKE_CLUSTER_NAME="${SPOKE_CLUSTER_NAME:-${CLUSTER_PREFIX}onprem}"
+HUB_CTX="kind-${HUB_CLUSTER_NAME}"
+SPOKE_CTX="kind-${SPOKE_CLUSTER_NAME}"
 TEST_NS="sample-app"
 TEST_APP_NAME="smoke-test-app"
 KEYCLOAK_ADMIN_USER="${KEYCLOAK_ADMIN_USER:-admin}"
@@ -31,7 +35,7 @@ log_pass()  { echo -e "${GREEN}[PASS]${NC} $1"; ((TESTS_PASSED++)); }
 log_fail()  { echo -e "${RED}[FAIL]${NC} $1"; ((TESTS_FAILED++)); }
 log_info()  { echo -e "[INFO] $1"; }
 
-HUB_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' helmsman-hub-worker 2>/dev/null || echo "127.0.0.1")
+HUB_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${HUB_CLUSTER_NAME}-worker" 2>/dev/null || echo "127.0.0.1")
 KEYCLOAK_URL="http://${HUB_IP}:30081"
 VAULT_URL="http://${HUB_IP}:30082"
 
@@ -44,7 +48,7 @@ log_stage "1. Testing Keycloak OIDC Client Onboarding"
 ADMIN_TOKEN=$(curl -s -X POST "${KEYCLOAK_URL}/realms/master/protocol/openid-connect/token" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -d "username=${KEYCLOAK_ADMIN_USER}" \
-  -d "password=${KEYCLOAK_ADMIN_PASS}" \
+  --data-urlencode password@<(printf '%s' "$KEYCLOAK_ADMIN_PASS") \
   -d "grant_type=password" \
   -d "client_id=admin-cli" | jq -r '.access_token // empty')
 
@@ -52,7 +56,7 @@ if [ -n "$ADMIN_TOKEN" ]; then
   log_pass "Keycloak admin authentication successful"
 
   # Register or verify test application client in Keycloak
-  CLIENT_EXISTS=$(curl -s -H "Authorization: Bearer $ADMIN_TOKEN" \
+  CLIENT_EXISTS=$(curl -s -H @<(printf 'Authorization: Bearer %s\n' "$ADMIN_TOKEN") \
     "${KEYCLOAK_URL}/admin/realms/helmsman/clients?clientId=${TEST_APP_NAME}" | jq -r '.[0].clientId // empty')
 
   if [ "$CLIENT_EXISTS" == "$TEST_APP_NAME" ]; then
@@ -60,7 +64,7 @@ if [ -n "$ADMIN_TOKEN" ]; then
   else
     # Create the client dynamically
     CREATE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST "${KEYCLOAK_URL}/admin/realms/helmsman/clients" \
-      -H "Authorization: Bearer $ADMIN_TOKEN" \
+      -H @<(printf 'Authorization: Bearer %s\n' "$ADMIN_TOKEN") \
       -H "Content-Type: application/json" \
       -d '{"clientId":"'"$TEST_APP_NAME"'", "directAccessGrantsEnabled":true, "publicClient":false}')
 
@@ -81,7 +85,7 @@ log_stage "2. Testing Vault Secret Storage"
 
 # Write dynamic test secret to Vault for the onboarded app
 VAULT_WRITE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-  -H "X-Vault-Token: ${VAULT_TOKEN}" \
+  -H @<(printf 'X-Vault-Token: %s\n' "$VAULT_TOKEN") \
   -H "Content-Type: application/json" \
   -d '{"data": {"client_id": "'"$TEST_APP_NAME"'", "client_secret": "super-secret-token-123"}}' \
   "${VAULT_URL}/v1/secret/data/${TEST_NS}/config" || echo "000")

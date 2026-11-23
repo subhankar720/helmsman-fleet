@@ -120,7 +120,8 @@ def read_state():
         die("state dir not found: %s" % STATE)
     for n in sorted(os.listdir(STATE)):
         p = os.path.join(STATE, n)
-        if n in NOT_IN_SEED or n.startswith(".") or n.endswith(".tmp") or not os.path.isfile(p):
+        if (n in NOT_IN_SEED or n.startswith(".") or n.endswith((".tmp", ".log", ".out"))
+                or not os.path.isfile(p)):
             continue
         with open(p) as fh:
             files[n] = fh.read()

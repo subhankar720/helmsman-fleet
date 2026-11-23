@@ -75,6 +75,14 @@ for arg in "$@"; do
     esac
 done
 
+# Cluster names are settings (WO-1.5b), same defaults and meaning as dev-up-gemini.sh.
+CLUSTER_PREFIX="${CLUSTER_PREFIX:-helmsman-}"
+HUB_CLUSTER_NAME="${HUB_CLUSTER_NAME:-${CLUSTER_PREFIX}hub}"
+SPOKE_CLUSTER_NAME="${SPOKE_CLUSTER_NAME:-${CLUSTER_PREFIX}onprem}"
+ARGO_SPOKE_NAME="${ARGO_SPOKE_NAME:-helmsman-onprem}"   # destination.name in git, not the kind name
+HUB_CONTEXT="kind-${HUB_CLUSTER_NAME}"
+SPOKE_CONTEXT="kind-${SPOKE_CLUSTER_NAME}"
+
 # Keycloak admin password and Vault root token: from the environment or from the
 # mode-600 files dev-up-gemini.sh uses (no defaults here; see docs/credentials.md).
 HELMSMAN_STATE_DIR="${HELMSMAN_STATE_DIR:-$HOME/.helmsman-dev}"
@@ -90,22 +98,20 @@ ARGOCD_USER="admin"
 # Password resolution order: explicit env var > durable password file written
 # by dev-up-gemini.sh > argocd-initial-admin-secret (only exists right after a
 # fresh --reset, before dev-up-gemini.sh deletes it).
-ARGOCD_PASS_FILE="${ARGOCD_PASS_FILE:-$HOME/.helmsman-dev/argocd-admin-password}"
+ARGOCD_PASS_FILE="${ARGOCD_PASS_FILE:-$HELMSMAN_STATE_DIR/argocd-admin-password}"
 ARGOCD_PASS="${ARGOCD_PASS:-}"
 if [ -z "$ARGOCD_PASS" ] && [ -f "$ARGOCD_PASS_FILE" ]; then
-    ARGOCD_PASS=$(cat "$ARGOCD_PASS_FILE" 2>/dev/null || echo "")
+    ARGOCD_PASS=$(tr -d '\n' < "$ARGOCD_PASS_FILE" 2>/dev/null || echo "")
 fi
 if [ -z "$ARGOCD_PASS" ]; then
-    ARGOCD_PASS=$(kubectl get secret argocd-initial-admin-secret -n argocd -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+    ARGOCD_PASS=$(kubectl --context "$HUB_CONTEXT" get secret argocd-initial-admin-secret -n argocd -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
 fi
 
-HUB_CONTEXT="kind-helmsman-hub"
-SPOKE_CONTEXT="kind-helmsman-onprem"
-SPOKE_CONTAINER="helmsman-onprem-control-plane"
-HUB_CONTAINER="helmsman-hub-control-plane"
-HUB_WORKER_CONTAINER="helmsman-hub-worker"
-CLUSTER_SECRET_NAME="cluster-helmsman-onprem"
-CLUSTER_REGISTERED_NAME="helmsman-onprem"
+SPOKE_CONTAINER="${SPOKE_CLUSTER_NAME}-control-plane"
+HUB_CONTAINER="${HUB_CLUSTER_NAME}-control-plane"
+HUB_WORKER_CONTAINER="${HUB_CLUSTER_NAME}-worker"
+CLUSTER_SECRET_NAME="cluster-${ARGO_SPOKE_NAME}"
+CLUSTER_REGISTERED_NAME="${ARGO_SPOKE_NAME}"
 ARGOCD_NAMESPACE="argocd"
 SAMPLE_APP_APP_NAME="sample-app-helmsman-onprem"
 SAMPLE_APP_NAMESPACE="sample-app"
@@ -185,8 +191,8 @@ done
 # a lost endpoint on the kind network, and a host port taken by another
 # container that started first. dev-up-gemini.sh Stage 1 fixes the first and
 # names the culprit for the second.
-for CONTAINER in helmsman-hub-control-plane helmsman-hub-worker helmsman-hub-worker2 \
-                 helmsman-onprem-control-plane helmsman-onprem-worker; do
+for CONTAINER in "${HUB_CLUSTER_NAME}-control-plane" "${HUB_CLUSTER_NAME}-worker" "${HUB_CLUSTER_NAME}-worker2" \
+                 "${SPOKE_CLUSTER_NAME}-control-plane" "${SPOKE_CLUSTER_NAME}-worker"; do
     docker inspect "$CONTAINER" > /dev/null 2>&1 || continue
     if [ "$(docker inspect "$CONTAINER" --format '{{len .NetworkSettings.Networks}}')" = "0" ]; then
         fail "$CONTAINER has no endpoint on the kind network (boot fails: 'old IPv4 address but no current IPv4 address')"
@@ -220,7 +226,7 @@ NODE_IP_DRIFT=false
 while IFS= read -r node_line; do
     NODE_NAME=$(echo "$node_line" | awk '{print $1}')
     NODE_IP=$(echo "$node_line"   | awk '{print $6}')
-    CONTAINER_NAME="helmsman-hub-${NODE_NAME##helmsman-hub-}"
+    CONTAINER_NAME="${HUB_CLUSTER_NAME}-${NODE_NAME##"${HUB_CLUSTER_NAME}"-}"
     CONTAINER_IP=$(docker inspect "$CONTAINER_NAME" \
         --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null || echo "")
     if [ -z "$CONTAINER_IP" ]; then
@@ -585,12 +591,23 @@ cleanup_pf() { kill "$ARGOCD_PF_PID" 2>/dev/null || true; }
 trap cleanup_pf EXIT
 sleep 3
 
+# The password goes to the Argo CD API in a request body (python reads it from its
+# environment); the session token is exported as ARGOCD_AUTH_TOKEN for the argocd CLI.
+argocd_token() {
+    ARGOCD_LOGIN_PASS="$1" ARGOCD_LOGIN_USER="$ARGOCD_USER" python3 - "$ARGOCD_SERVER" <<'PY'
+import json, os, ssl, sys, urllib.request
+body = json.dumps({"username": os.environ["ARGOCD_LOGIN_USER"],
+                   "password": os.environ["ARGOCD_LOGIN_PASS"]}).encode()
+req = urllib.request.Request("https://%s/api/v1/session" % sys.argv[1], data=body,
+                             headers={"Content-Type": "application/json"})
+with urllib.request.urlopen(req, timeout=15, context=ssl._create_unverified_context()) as r:
+    print(json.load(r)["token"])
+PY
+}
 LOGIN_OK=false
 for i in 1 2 3; do
-    if argocd login "$ARGOCD_SERVER" \
-        --username "$ARGOCD_USER" \
-        --password "$ARGOCD_PASS" \
-        --insecure > /dev/null 2>&1; then
+    if ARGOCD_AUTH_TOKEN=$(argocd_token "$ARGOCD_PASS" 2>/dev/null) && [ -n "$ARGOCD_AUTH_TOKEN" ]; then
+        export ARGOCD_AUTH_TOKEN
         ok "Argo CD CLI session authenticated via port-forward :${ARGOCD_PF_PORT}"
         LOGIN_OK=true
         break
@@ -1040,12 +1057,12 @@ if [ -n "$GW_SVC" ]; then
               curl -s -o /dev/null -w 'ping=%{http_code}\n' --max-time 5 -H 'Host: agentforge.helmsman.local' '${GW_URL}/ping'
               curl -s -o /dev/null -w 'start=%{http_code} %{redirect_url}\n' --max-time 5 -H 'Host: agentforge.helmsman.local' '${GW_URL}/oauth2/start'
               curl -s -o /dev/null -w 'noauth=%{http_code}\n' --max-time 5 -H 'Host: agentforge.helmsman.local' '${GW_URL}/v1/agents'
-              T=\$(curl -s --max-time 10 'http://${HUB_IP}:30081/realms/helmsman/protocol/openid-connect/token' \
-                  -d grant_type=password -d client_id=agentforge-cli -d username=subhankar --data-urlencode \"password=\$P\" \
+              T=\$(printf '%s' \"\$P\" | curl -s --max-time 10 'http://${HUB_IP}:30081/realms/helmsman/protocol/openid-connect/token' \
+                  -d grant_type=password -d client_id=agentforge-cli -d username=subhankar --data-urlencode password@- \
                   | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p')
               echo \"token=\${T:+yes}\"
-              [ -n \"\$T\" ] && curl -s -o /dev/null -w 'api=%{http_code}\n' --max-time 10 -H 'Host: agentforge.helmsman.local' \
-                  -H \"Authorization: Bearer \$T\" '${GW_URL}/v1/agents'
+              [ -n \"\$T\" ] && printf 'Authorization: Bearer %s\n' \"\$T\" | curl -s -o /dev/null -w 'api=%{http_code}\n' --max-time 10 \
+                  -H 'Host: agentforge.helmsman.local' -H @- '${GW_URL}/v1/agents'
             " 2>/dev/null || echo "")
         echo "$AF_E2E" | grep -q '^ping=200' && echo "$AF_E2E" | grep -q "^start=302 http://${HUB_IP}:30081/" \
             && echo "$AF_E2E" | grep -q '^api=200' && break
@@ -1089,9 +1106,10 @@ elif [ -z "$VAULT_TOKEN" ]; then
     fail "VAULT_TOKEN not set: export it or write $HELMSMAN_STATE_DIR/vault-root-token (chmod 600); see docs/credentials.md"
 else
     for P in auth llm db cache confluence; do
-        DATA=$(kubectl --context "$HUB_CONTEXT" -n vault exec "$VAULT_POD" -- \
-            env VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN="$VAULT_TOKEN" \
-            vault kv get -format=json "secret/agentforge/$P" 2>/dev/null || echo "")
+        # token on stdin, never in the exec arguments
+        DATA=$(printf '%s\n' "$VAULT_TOKEN" | kubectl --context "$HUB_CONTEXT" -n vault exec -i "$VAULT_POD" -- \
+            sh -c 'read -r VAULT_TOKEN; export VAULT_TOKEN VAULT_ADDR=http://127.0.0.1:8200; exec vault kv get -format=json "secret/agentforge/$1" </dev/null' \
+            sh "$P" 2>/dev/null || echo "")
         if [ -z "$DATA" ]; then
             fail "Vault secret/agentforge/$P missing — $AF_FIX"
             continue
@@ -1123,22 +1141,24 @@ fi
 
 # --- Keycloak: agentforge-gateway client, groups, user -------------------------
 [ -n "$KEYCLOAK_ADMIN_PASS" ] || fail "KEYCLOAK_ADMIN_PASS not set: export it or write $HELMSMAN_STATE_DIR/keycloak-admin-password (chmod 600); see docs/credentials.md"
-KC_REPORT=$(docker exec "$HUB_CONTAINER" sh -c "
-    T=\$(curl -s --max-time 10 -X POST http://${HUB_IP}:30081/realms/master/protocol/openid-connect/token \
+KC_REPORT=$(printf '%s\n' "$KEYCLOAK_ADMIN_PASS" | docker exec -i "$HUB_CONTAINER" bash -c "
+    read -r KP   # admin password on stdin, never in an argument
+    T=\$(printf '%s' \"\$KP\" | curl -s --max-time 10 -X POST http://${HUB_IP}:30081/realms/master/protocol/openid-connect/token \
         -d grant_type=password -d client_id=admin-cli \
-        -d username='${KEYCLOAK_ADMIN_USER:-admin}' -d password='${KEYCLOAK_ADMIN_PASS}' \
+        -d username='${KEYCLOAK_ADMIN_USER:-admin}' --data-urlencode password@- \
         | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p')
+    H() { printf 'Authorization: Bearer %s\n' \"\$T\"; }   # header from a pipe, not an argument
     K=http://${HUB_IP}:30081/admin/realms/helmsman
-    echo \"CLIENT \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients?clientId=agentforge-gateway\")\"
-    CID=\$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients?clientId=agentforge-gateway\" | sed -n 's/^\\[{\"id\":\"\\([^\"]*\\)\".*/\\1/p')
-    [ -n \"\$CID\" ] && echo \"SECRET \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients/\$CID/client-secret\")\"
-    echo \"CLI \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/clients?clientId=agentforge-cli\")\"
+    echo \"CLIENT \$(curl -s --max-time 10 -H @<(H) \"\$K/clients?clientId=agentforge-gateway\")\"
+    CID=\$(curl -s --max-time 10 -H @<(H) \"\$K/clients?clientId=agentforge-gateway\" | sed -n 's/^\\[{\"id\":\"\\([^\"]*\\)\".*/\\1/p')
+    [ -n \"\$CID\" ] && echo \"SECRET \$(curl -s --max-time 10 -H @<(H) \"\$K/clients/\$CID/client-secret\")\"
+    echo \"CLI \$(curl -s --max-time 10 -H @<(H) \"\$K/clients?clientId=agentforge-cli\")\"
     for P in ${AF_KC_GROUPS}; do
-        echo \"GP\$P \$(curl -s -o /dev/null -w %{http_code} --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/group-by-path\$P\")\"
+        echo \"GP\$P \$(curl -s -o /dev/null -w %{http_code} --max-time 10 -H @<(H) \"\$K/group-by-path\$P\")\"
     done
     for U in ${AF_KC_USERS_LIST}; do
-        ID=\$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/users?exact=true&username=\$U\" | sed -n 's/^\\[{\"id\":\"\\([^\"]*\\)\".*/\\1/p')
-        [ -n \"\$ID\" ] && echo \"MEMBER:\$U \$(curl -s --max-time 10 -H \"Authorization: Bearer \$T\" \"\$K/users/\$ID/groups\")\"
+        ID=\$(curl -s --max-time 10 -H @<(H) \"\$K/users?exact=true&username=\$U\" | sed -n 's/^\\[{\"id\":\"\\([^\"]*\\)\".*/\\1/p')
+        [ -n \"\$ID\" ] && echo \"MEMBER:\$U \$(curl -s --max-time 10 -H @<(H) \"\$K/users/\$ID/groups\")\"
     done
 " 2>/dev/null || echo "")
 KC_CS_LIVE=$(kubectl --context "$SPOKE_CONTEXT" -n gateway-infra get secret agentforge-oauth2-proxy-secret \

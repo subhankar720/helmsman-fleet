@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # tests/lib/wait.sh — context defaults and Kubernetes helpers.
 # Converged environments (single cluster): export HUB_CTX="$SPOKE_CTX".
-HUB_CTX="${HUB_CTX:-kind-helmsman-hub}"
-SPOKE_CTX="${SPOKE_CTX:-kind-helmsman-onprem}"
+# Defaults follow CLUSTER_PREFIX like dev-up-gemini.sh (WO-1.5b): helmsman- -> kind-helmsman-hub/-onprem.
+HUB_CTX="${HUB_CTX:-kind-${CLUSTER_PREFIX:-helmsman-}hub}"
+SPOKE_CTX="${SPOKE_CTX:-kind-${CLUSTER_PREFIX:-helmsman-}onprem}"
 
 k() { kubectl --context "$SPOKE_CTX" "$@"; }
 
