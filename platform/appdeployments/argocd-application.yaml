@@ -1,0 +1,40 @@
+# platform-appdeployments: every AppDeployment in appdeployments/ (today only sample-app, a
+# test fixture for the operator, the Helm chart path and Argo), delivered by Argo CD like
+# agentforge. Owned by platform-root. Before WO-1.5b sample-app's AppDeployment was applied by
+# hand once, so a rebuilt pair had none and run-all's lifecycle test (which copies its spec)
+# failed.
+#
+# On a fresh pair this Application exists before its CRD: the operator and the AppDeployment
+# CRD are deployed by dev-up Stage 4.5 (WO-1.4 moves them under GitOps), and the sample-app
+# namespace is created by the ApplicationSet. Until both exist the sync fails and is retried;
+# SkipDryRunOnMissingResource keeps the missing CRD from failing the dry run of the whole app.
+# No CreateNamespace: the namespace comes from the ApplicationSet with its labels.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-appdeployments
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/compare-options: ServerSideDiff=true
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/subhankar720/helmsman-fleet.git
+    targetRevision: main
+    path: appdeployments
+  destination:
+    name: helmsman-onprem
+    namespace: sample-app
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: 15
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 3m

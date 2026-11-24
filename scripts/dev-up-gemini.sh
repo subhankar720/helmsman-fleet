@@ -1245,25 +1245,7 @@ EOF
   fi
 fi
 
-# AppDeployments from git (helmsman-fleet appdeployments/*.yaml). On kind the operator is
-# deployed by Stage 4.5, not by Argo (WO-1.4 moves both under GitOps); until then dev-up applies
-# its AppDeployments, after the sample-app sync above so each namespace exists. Before WO-1.5b
-# sample-app's was applied by hand once and a rebuilt pair had none (run-all's lifecycle test
-# copies it). Server-side apply with git as the source of truth.
-for AD_FILE in "$FLEET_DIR"/appdeployments/*.yaml; do
-  [ -f "$AD_FILE" ] || continue
-  AD_NS=$(awk '$1=="namespace:" {print $2; exit}' "$AD_FILE")
-  if [ -n "$AD_NS" ] && ! kubectl --context "$SPOKE_CTX" get namespace "$AD_NS" > /dev/null 2>&1; then
-    log_warn "AppDeployment $(basename "$AD_FILE"): namespace $AD_NS does not exist yet — skipped"
-    continue
-  fi
-  if kubectl --context "$SPOKE_CTX" apply --server-side --force-conflicts --field-manager=dev-up \
-      -f "$AD_FILE" > /dev/null 2>&1; then
-    log_ok "AppDeployment applied from git: $(basename "$AD_FILE" .yaml)"
-  else
-    log_warn "AppDeployment apply failed: $AD_FILE"
-  fi
-done
+# AppDeployments (appdeployments/) are delivered by Argo CD: platform-appdeployments (WO-1.5b).
 
 # =============================================================================
 # Stage 10.5: AgentForge Platform State

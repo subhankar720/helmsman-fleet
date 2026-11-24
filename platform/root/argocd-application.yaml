@@ -26,7 +26,7 @@ spec:
     path: .
     directory:
       recurse: true
-      include: '{applicationsets/apps-appset.yaml,apps/agentforge/argocd-application.yaml,platform/access-rbac/argocd-application.yaml,platform/envoy-gateway/argocd-application.yaml,platform/envoy-gateway/spoke-application.yaml,platform/eso/argocd-application.yaml,platform/keycloak/argocd-application.yaml,platform/kyverno/argocd-application.yaml,platform/kyverno/policies/argocd-application.yaml,platform/oauth2-proxy-agentforge/argocd-application.yaml,platform/observability/kube-prometheus-stack-application.yaml,platform/observability/loki-application.yaml,platform/observability/loki-nodeport.yaml,platform/vault/argocd-application.yaml}'
+      include: '{applicationsets/apps-appset.yaml,platform/appdeployments/argocd-application.yaml,apps/agentforge/argocd-application.yaml,platform/access-rbac/argocd-application.yaml,platform/envoy-gateway/argocd-application.yaml,platform/envoy-gateway/spoke-application.yaml,platform/eso/argocd-application.yaml,platform/keycloak/argocd-application.yaml,platform/kyverno/argocd-application.yaml,platform/kyverno/policies/argocd-application.yaml,platform/oauth2-proxy-agentforge/argocd-application.yaml,platform/observability/kube-prometheus-stack-application.yaml,platform/observability/loki-application.yaml,platform/observability/loki-nodeport.yaml,platform/vault/argocd-application.yaml}'
   destination:
     server: https://kubernetes.default.svc
     namespace: argocd

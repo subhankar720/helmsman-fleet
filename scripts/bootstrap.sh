@@ -40,7 +40,7 @@ export SPOKE_CLUSTER_NAME="${SPOKE_CLUSTER_NAME:-${CLUSTER_PREFIX}onprem}"
 export HUB_CTX="kind-${HUB_CLUSTER_NAME}" SPOKE_CTX="kind-${SPOKE_CLUSTER_NAME}"
 export HELMSMAN_STATE_DIR="${HELMSMAN_STATE_DIR:-$HOME/.helmsman-dev}"
 export SOPS_AGE_KEY_FILE="${SOPS_AGE_KEY_FILE:-$HELMSMAN_STATE_DIR/age.key}"
-ARGO_MIN_APPS="${ARGO_MIN_APPS:-14}"
+ARGO_MIN_APPS="${ARGO_MIN_APPS:-16}"   # Applications on the hub: platform-root, its children and sample-app (16 since WO-1.5b)
 ARGO_WAIT_SECONDS="${ARGO_WAIT_SECONDS:-1500}"
 
 mkdir -p "$HELMSMAN_STATE_DIR" && chmod 700 "$HELMSMAN_STATE_DIR"
