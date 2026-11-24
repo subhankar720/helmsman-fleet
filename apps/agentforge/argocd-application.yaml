@@ -29,6 +29,14 @@ spec:
     syncOptions:
       - CreateNamespace=true
       - ServerSideApply=true
+    # On a fresh pair Argo syncs this app before dev-up has filled secret/agentforge/* in Vault,
+    # so the first sync fails on the ExternalSecret. Retry long enough to outlast that (WO-1.5b).
+    retry:
+      limit: 15
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 3m
     # Kyverno policies target namespaces with this label
     managedNamespaceMetadata:
       labels:

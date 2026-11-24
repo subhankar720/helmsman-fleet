@@ -1816,7 +1816,7 @@ for W in statefulset/agentforge-postgres statefulset/agentforge-redis deployment
     # Kyverno rejects the Deployment itself when the image can't be verified
     REASON=$(kubectl --context "$HUB_CTX" -n argocd get application agentforge \
       -o jsonpath='{.status.operationState.syncResult.resources[?(@.name=="'"${W#*/}"'")].message}' 2>/dev/null \
-      | grep -o "failed to verify image[^']*" | head -1 | cut -c1-160)
+      | grep -o "failed to verify image[^']*" | head -1 | cut -c1-160 || true)  # no match is normal; must not end the run under pipefail
     log_warn "AgentForge ${W#*/} not deployed${REASON:+ — Kyverno: $REASON}"
   elif [ "${HAVE:-0}" -ge "$WANT" ] 2>/dev/null; then
     log_ok "AgentForge ${W#*/} ready (${HAVE}/${WANT})"

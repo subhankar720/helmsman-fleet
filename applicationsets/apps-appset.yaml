@@ -54,3 +54,7 @@ spec:
           selfHeal: true   # revert manual cluster edits
         syncOptions:
           - CreateNamespace=true
+          # Server-side apply, as for agentforge: Kyverno's verifyImages pins each signed image to
+          # its digest at admission (tag -> tag@sha256:...). With client-side apply Argo reports
+          # that as permanent drift and never shows Synced on a freshly built pair (WO-1.5b).
+          - ServerSideApply=true
