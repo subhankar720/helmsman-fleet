@@ -1213,7 +1213,10 @@ EOF
 
   if argocd app get sample-app-helmsman-onprem \
       --server "localhost:${ARGOCD_PF_PORT}" --insecure > /dev/null 2>&1; then
-    if argocd app sync sample-app-helmsman-onprem --force --timeout 120 \
+    # No --force: the app uses ServerSideApply=true (Kyverno digest pinning) and Argo rejects
+    # force with server-side apply. The stale hook Job is deleted above and the hooks use
+    # BeforeHookCreation, so a plain sync re-runs them.
+    if argocd app sync sample-app-helmsman-onprem --timeout 120 \
         --server "localhost:${ARGOCD_PF_PORT}" --insecure > /dev/null 2>&1; then
       log_ok "Sync triggered: sample-app-helmsman-onprem"
     else

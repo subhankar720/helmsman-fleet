@@ -30,6 +30,11 @@ spec:
       # Name: <app-directory-name>-<cluster-name>
       # e.g. sample-app-helmsman-onprem
       name: '{{path.basename}}-{{name}}'
+      annotations:
+        # As for agentforge: diff from a server-side dry run. Kyverno pins each signed image to
+        # its digest at admission (tag -> tag@sha256:...); a client-side diff reports that as
+        # permanent drift, so a freshly built pair never shows Synced (WO-1.5b rebuild test).
+        argocd.argoproj.io/compare-options: ServerSideDiff=true
     spec:
       project: default
       # Multi-source: chart comes from golden-path-chart/,
@@ -54,7 +59,6 @@ spec:
           selfHeal: true   # revert manual cluster edits
         syncOptions:
           - CreateNamespace=true
-          # Server-side apply, as for agentforge: Kyverno's verifyImages pins each signed image to
-          # its digest at admission (tag -> tag@sha256:...). With client-side apply Argo reports
-          # that as permanent drift and never shows Synced on a freshly built pair (WO-1.5b).
+          # Server-side apply, as for agentforge; goes with ServerSideDiff above (WO-1.5b).
+          # dev-up therefore syncs this app without --force (Argo rejects force with SSA).
           - ServerSideApply=true
