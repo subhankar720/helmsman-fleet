@@ -62,3 +62,10 @@ spec:
           # Server-side apply, as for agentforge; goes with ServerSideDiff above (WO-1.5b).
           # dev-up therefore syncs this app without --force (Argo rejects force with SSA).
           - ServerSideApply=true
+        # A first sync on a fresh pair can fail on the ExternalSecret (wave -1); retry it (WO-1.5b).
+        retry:
+          limit: 15
+          backoff:
+            duration: 15s
+            factor: 2
+            maxDuration: 3m

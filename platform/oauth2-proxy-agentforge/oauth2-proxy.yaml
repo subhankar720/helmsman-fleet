@@ -5,6 +5,10 @@ kind: ExternalSecret
 metadata:
   name: agentforge-oauth2-proxy-secret
   namespace: gateway-infra
+  annotations:
+    # Own wave before the workload that mounts this Secret: on a fresh pair a failure here ends
+    # the sync (and it is retried) instead of Argo waiting forever for the workload (WO-1.5b).
+    argocd.argoproj.io/sync-wave: "-1"
 spec:
   refreshInterval: 1h
   secretStoreRef:

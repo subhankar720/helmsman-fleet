@@ -25,3 +25,10 @@ spec:
     syncOptions:
       - CreateNamespace=true
       - ServerSideApply=true
+    # A first sync on a fresh pair can fail on the ExternalSecret (wave -1); retry it (WO-1.5b).
+    retry:
+      limit: 15
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 3m
