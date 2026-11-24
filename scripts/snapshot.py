@@ -4,6 +4,9 @@
   snapshot.py take   [--only NAME,...]   write ~/.helmsman-dev/snapshots/<UTC-date>/<name>-<HHMMSSZ>.<ext>.age
   snapshot.py check  [DIR]               decrypt each file in memory; print size, sha256/16 and counts
   snapshot.py restore-db FILE            pg_restore an AgentForge DB snapshot into the spoke Postgres
+  snapshot.py restore-vault FILE [--overwrite]
+                                         write every path of a vault-kv snapshot back into Vault
+                                         (default: only paths that are missing; token from the state dir)
 
 Snapshots (each encrypted to the age PUBLIC key from .sops.yaml; files mode 600, dir mode 700):
   agentforge-db   pg_dump -Fc of the AgentForge database (streamed: kubectl exec | age > file)
@@ -235,15 +238,34 @@ def cmd_restore_db(a):
     return r.returncode
 
 
+def cmd_restore_vault(a):
+    snap = json.loads(decrypt(a.file))
+    with Vault(state_file("vault-root-token")) as v:
+        if not v.token_ok():
+            die("Vault refused the root token from the state dir")
+        bad = 0
+        for path in sorted(snap):
+            live = v.get(path)
+            if live is not None and not a.overwrite:
+                print("kept     secret/%s (present; --overwrite replaces it)" % path)
+                continue
+            ok = v.put(path, snap[path]["data"])
+            bad += not ok
+            print("%-8s secret/%s (%d properties)" % ("written" if ok else "FAILED", path, len(snap[path]["data"])))
+    return 1 if bad else 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("take"); t.add_argument("--only")
     c = sub.add_parser("check"); c.add_argument("dir", nargs="?")
     r = sub.add_parser("restore-db"); r.add_argument("file")
+    rv = sub.add_parser("restore-vault"); rv.add_argument("file"); rv.add_argument("--overwrite", action="store_true")
     a = ap.parse_args()
     print("hub=%s spoke=%s snapshots=%s" % (HUB_CTX, SPOKE_CTX, SNAPROOT.replace(os.path.expanduser("~"), "~")))
-    return {"take": cmd_take, "check": cmd_check, "restore-db": cmd_restore_db}[a.cmd](a)
+    return {"take": cmd_take, "check": cmd_check, "restore-db": cmd_restore_db,
+            "restore-vault": cmd_restore_vault}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -243,7 +243,7 @@ elif ! $RESET_MODE; then
   load_credential ARGOCD_PASS "$ARGOCD_PASS_FILE" "Argo CD admin password (a --reset run writes this file)"
 fi
 load_credential KEYCLOAK_ADMIN_PASS "$HELMSMAN_STATE_DIR/keycloak-admin-password" "Keycloak master-realm admin password"
-load_credential VAULT_TOKEN "$HELMSMAN_STATE_DIR/vault-root-token" "Vault dev-mode root token (must equal VAULT_DEV_ROOT_TOKEN_ID in helmsman-fleet platform/vault/deployment.yaml)"
+load_credential VAULT_TOKEN "$HELMSMAN_STATE_DIR/vault-root-token" "Vault dev-mode root token (dev-up writes it to hub Secret vault/vault-root-token, which Vault reads at start)"
 load_credential GRAFANA_ADMIN_PASS "$HELMSMAN_STATE_DIR/grafana-admin-password" "Grafana admin password (hub Secret monitoring/grafana-admin-credentials)"
 if [ ${#MISSING_CREDENTIALS[@]} -gt 0 ]; then
   log_error "Missing credentials; nothing has been changed. See helmsman-fleet/docs/credentials.md"
@@ -319,6 +319,25 @@ create_kind_cluster() {  # NAME CONFIG-FILE: creates it; with --bootstrap an exi
   kind create cluster --name "$name" --config "$cfg" || { rm -f "$cfg"; log_error "kind create cluster $name failed"; exit 1; }
   rm -f "$cfg"
   log_ok "Kind cluster $name created"
+}
+
+# Vault root token Secret on the hub (platform/vault/deployment.yaml reads it). Vault -dev reads
+# it only at start: a changed value takes effect on the next Vault restart, which empties Vault.
+ensure_vault_root_secret() {
+  kubectl --context "$HUB_CTX" get namespace vault > /dev/null 2>&1 || \
+    kubectl --context "$HUB_CTX" create namespace vault > /dev/null 2>&1 || true
+  kubectl --context "$HUB_CTX" create secret generic vault-root-token -n vault \
+    --from-file=token=<(printf '%s' "$VAULT_TOKEN") \
+    --dry-run=client -o yaml | kubectl --context "$HUB_CTX" apply -f - > /dev/null 2>&1 || true
+  # Read it back: Vault starts with whatever this Secret holds, so a stale or missing value
+  # would lock every reader out. Compared in the shell; the value is never printed.
+  local got
+  got=$(kubectl --context "$HUB_CTX" -n vault get secret vault-root-token \
+        -o jsonpath='{.data.token}' 2>/dev/null | base64 -d 2>/dev/null) || true
+  if [ "$got" != "$VAULT_TOKEN" ]; then
+    log_error "hub Secret vault/vault-root-token does not hold the Vault token from the state file"
+    exit 1
+  fi
 }
 
 # Grafana admin Secret on the hub (chart: grafana.admin.existingSecret). The value goes in via
@@ -398,6 +417,8 @@ fi
   log_step "Stage R3.5: Pre-seeding Hub Platform Bootstrap Secrets"
   ensure_grafana_admin_secret
   log_ok "grafana-admin-credentials pre-seeded on Hub"
+  ensure_vault_root_secret
+  log_ok "vault-root-token pre-seeded on Hub (read by Vault at start)"
   # Create Keycloak namespace and secret to prevent CreateContainerConfigError
   kubectl --context "$HUB_CTX" create namespace keycloak --dry-run=client -o yaml | \
     kubectl --context "$HUB_CTX" apply -f -
@@ -930,6 +951,8 @@ kubectl --context "$HUB_CTX" create secret generic keycloak-admin-credentials \
 log_ok "keycloak-admin-credentials verified on Hub"
 ensure_grafana_admin_secret
 log_ok "grafana-admin-credentials verified on Hub"
+ensure_vault_root_secret
+log_ok "vault-root-token verified on Hub"
 
 APP_NAMESPACES=$(kubectl --context "$SPOKE_CTX" get namespaces \
   --no-headers -o custom-columns=":metadata.name" 2>/dev/null \

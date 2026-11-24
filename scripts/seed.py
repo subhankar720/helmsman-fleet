@@ -65,6 +65,8 @@ def secrets_spec(seed):
     f = seed.get("files", {})
     out = []
     if "vault-root-token" in f:
+        out.append((HUB_CTX, "vault", "vault-root-token", "Opaque",
+                    {"token": f["vault-root-token"]}))      # read by the Vault Deployment
         out.append((SPOKE_CTX, "external-secrets", "vault-token", "Opaque",
                     {"token": f["vault-root-token"]}))
     if "keycloak-admin-password" in f:
