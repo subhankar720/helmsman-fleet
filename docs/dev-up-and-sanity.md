@@ -35,7 +35,9 @@ script rather than one replacing the other.
 ## State kept outside the clusters (`~/.helmsman-dev/`, mode 600)
 
 Vault runs `server -dev` (in-memory) and Keycloak has no PVC, so anything written to them at
-runtime is lost on restart. dev-up backs it up here on every run and restores it when missing.
+runtime is lost on restart. Every credential file below is also in the encrypted seed
+`secrets.enc.yaml` ([credentials.md](credentials.md)): `scripts/seed.py materialise` recreates the files on a new
+machine. dev-up backs runtime state up here on every run and restores it when missing.
 
 | File | Contents | Written by |
 | --- | --- | --- |
@@ -46,19 +48,27 @@ runtime is lost on restart. dev-up backs it up here on every run and restores it
 | `keycloak-af-platform-user-password`, `keycloak-af-readonly-user-password` | Passwords of the AgentForge test users. Generated on first creation. | Stage 10.5 |
 | `last-dev-up` | Time of the last successful run. A node started after it counts as restarted. | Stage 11 |
 | `keycloak-admin-password`, `vault-root-token`, `grafana-admin-password` | Keycloak master admin password, Vault dev root token, Grafana admin password. dev-up stops (exit 2, nothing changed) if one is missing. See [credentials.md](credentials.md) | you |
-| `keycloak-platform-admin-password` | Password of the `helmsman`-realm test user `platform-admin`, which has none in git | you, or a rotation |
+| `keycloak-platform-admin-password` | Not used since WO-1.5b removed `platform-admin` from the realm import | (left over; still in the seed) |
+| `cosign.key`, `acmedns-registration.json` | Image-signing key (manual use), acme-dns registration (DNS-01, later work order) | you |
+| `age.key` | The age private key that decrypts the seed and the snapshots. **Never in the seed or git.** See [bootstrap.md](bootstrap.md#the-age-key) | you |
+| `snapshots/<date>/*.age` | Encrypted snapshots of the AgentForge DB, the Keycloak realm, Vault and Argo objects | `scripts/snapshot.py take` |
+| `bootstrap.log`, `bootstrap-<time>.out` | One line per bootstrap step (timing, exit code); full output of each run (mode 600) | `scripts/bootstrap.sh` |
 | `dev-up.log` | One line per dev-up run: UTC start and end, flags, mode, exit code. No secrets or command output | every run |
 
 ## dev-up stages
 
-### `--reset` only
+### `--reset` and `--bootstrap`
+
+`--bootstrap` (used by [`scripts/bootstrap.sh`](bootstrap.md)) runs the same stages but never deletes: R1 is skipped and
+existing clusters are kept. Cluster names, contexts and host ports come from `CLUSTER_PREFIX` and the other settings in
+[scripts.md](scripts.md#settings-environment-variables).
 
 | Stage | What it does |
 | --- | --- |
-| R1–R2 | Delete and recreate both kind clusters from `clusters/*.yaml` |
-| R3 | Install Argo CD (server-side apply), repo-server timeout, NodePort 30080, save the admin password |
-| R3.5, R6.5 | Pre-seed Keycloak admin credentials (hub) and the Vault token for ESO (spoke) |
-| R4–R6 | Port-forward and login, register the fleet repo and the spoke cluster |
+| R1–R2 | R1 (`--reset` only): delete both clusters. R2: create them from `clusters/*.yaml`, rendered with the configured names and host ports (`--bootstrap` keeps a cluster that exists) |
+| R3 | Install Argo CD `ARGOCD_VERSION` (pinned, server-side apply), repo-server timeout, NodePort 30080. `--reset` saves the initial admin password; `--bootstrap` keeps it until R4 |
+| R3.5, R6.5 | Pre-seed the hub Secrets (Grafana admin, Keycloak admin, `vault/vault-root-token`, which Vault reads at start) and the Vault token for ESO (spoke) |
+| R4–R6 | Port-forward and log in through the session API (`--bootstrap` then sets the admin password from the state file), register the fleet repo and the spoke cluster |
 | R7 | Apply every kubectl-managed Application: `platform/*/argocd-application.yaml`, Kyverno policies, `platform/envoy-gateway/spoke-application.yaml`, `apps/*/argocd-application.yaml`, observability, ApplicationSet |
 
 ### Every run
